@@ -329,12 +329,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # specialization, whose warp groups are partitioned across Dv.
             self.use_scheduler_barrier = False
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
-            self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
+            self.pack_gqa
+            and (
+                self.tile_m % self.qhead_per_kvhead != 0
+                or (self.has_qv and self.qhead_per_kvhead == 16)
+            )
         )
         self.use_tma_O = self.use_tma_Q and not self.is_split_kv
         # Producer needs more registers when doing cp.async Q or KV loads
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
-            self.num_mma_regs, self.num_producer_regs = 224, 40
+            self.num_mma_regs, self.num_producer_regs = (
+                (232, 40) if const_expr(self.has_qv) else (224, 40)
+            )
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
@@ -1624,6 +1630,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         seqlen=seqlen,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                         mask_fn=interior_mask_fn,
+                        check_inf=self.mask_mod is not None,
                     )
                     O_should_accumulate = True
                 # Separate iterations with local masking on the left

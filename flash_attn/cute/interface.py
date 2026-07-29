@@ -745,9 +745,13 @@ def _flash_attn_fwd(
     no_explicit_window = (
         window_size_left is None and window_size_right is None
     )
-    if is_context_parallel and causal and max_seqlen_q == 1 and no_explicit_window:
-        # Match FA3 decode semantics. With one query token every local key is
-        # visible, independent of how context-parallel ranks interleave keys.
+    if (
+        causal
+        and max_seqlen_q == 1
+        and no_explicit_window
+        and mask_mod is None
+    ):
+        # Match FA3 decode semantics. With one query token every key is visible.
         causal = False
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
@@ -792,6 +796,8 @@ def _flash_attn_fwd(
             pack_gqa = False
         if head_dim_v == 512:
             tile_m, tile_n, mma_pv_is_rs = 64, 64, False
+        elif pack_gqa and max_seqlen_q * qhead_per_kvhead <= 64:
+            tile_m, tile_n, mma_pv_is_rs = 64, 128, True
         else:
             tile_m, tile_n, mma_pv_is_rs = 128, 96, True
         intra_wg_overlap = False
