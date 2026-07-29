@@ -791,8 +791,10 @@ def _flash_attn_fwd(
     if arch // 10 == 9 and qv is not None:
         # Match FA3's Hopper MLA specialization. These tiles leave room for
         # the additional Qv tile and keep the mainloop non-overlapped.
-        # The DCP mask still uses unpacked query rows.
-        if is_context_parallel:
+        # Multi-token DCP causal masking still uses unpacked query rows. A q1
+        # decode has already been canonicalized to non-causal above, so it can
+        # safely retain PackGQA and avoid one CTA per query head.
+        if is_context_parallel and (max_seqlen_q != 1 or causal):
             pack_gqa = False
         if head_dim_v == 512:
             tile_m, tile_n, mma_pv_is_rs = 64, 64, False
@@ -1059,6 +1061,10 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask = None
         p = row_max = None
 
+    paged_kv_non_tma = page_size not in [None, tile_n]
+    if arch // 10 == 9 and qv is not None:
+        paged_kv_non_tma = page_size is not None and page_size % tile_n != 0
+
     compile_key = (
         dtype,
         head_dim,
@@ -1096,7 +1102,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, tile_n],  # paged KV non-TMA
+        paged_kv_non_tma,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1235,7 +1241,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
-                paged_kv_non_tma=page_size not in [None, tile_n],
+                paged_kv_non_tma=paged_kv_non_tma,
                 use_persistent_varlen=use_persistent_varlen,
                 use_dynamic_varlen=use_dynamic_varlen,
                 persistent_scheduler_sm_count=persistent_scheduler_sm_count,
@@ -1312,7 +1318,7 @@ def _flash_attn_fwd(
                         score_mod=score_mod,
                         mask_mod=mask_mod,
                         has_aux_tensors=aux_tensors is not None,
-                        paged_kv_non_tma=page_size not in [None, tile_n],
+                        paged_kv_non_tma=paged_kv_non_tma,
                         is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                         q_subtile_factor=q_subtile_factor,
                         use_2cta_instrs=use_2cta_instrs,
@@ -1338,7 +1344,7 @@ def _flash_attn_fwd(
                         score_mod=score_mod,
                         mask_mod=mask_mod,
                         has_aux_tensors=aux_tensors is not None,
-                        paged_kv_non_tma=page_size not in [None, tile_n],
+                        paged_kv_non_tma=paged_kv_non_tma,
                         is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                         q_subtile_factor=q_subtile_factor,
                         use_2cta_instrs=use_2cta_instrs,

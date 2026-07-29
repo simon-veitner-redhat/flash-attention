@@ -932,13 +932,25 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 tma_load_K_fn = None
                 tma_load_V_fn = None
                 if const_expr(self.use_tma_KV):
-                    # === TMA path (non-paged and paged with page_size == n_block_size) ===
+                    # === TMA path (non-paged and paged with page_size divisible by tile_n) ===
                     if const_expr(mPageTable is not None):
                         # Paged TMA: keep page dimension indexable
                         mK_cur = mK[None, None, head_idx_kv, None]
                         mV_cur = mV[None, None, head_idx_kv, None]
-                        gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
-                        gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
+                        gK = cute.local_tile(
+                            mK_cur,
+                            (self.tile_n, self.tile_hdim),
+                            (None, 0, None),
+                        )
+                        gV = cute.local_tile(
+                            mV_cur,
+                            (self.tile_n, self.tile_hdimv),
+                            (None, 0, None),
+                        )
+                        # Flatten (tile-within-page, physical-page) into the
+                        # single residual coordinate expected by the TMA copy.
+                        gK = cute.group_modes(gK, 2, 4)
+                        gV = cute.group_modes(gV, 2, 4)
                     else:
                         # Non-paged TMA
                         mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[
@@ -1038,8 +1050,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         if const_expr(self.use_tma_KV)
                         else cutlass.max(n_block_max - 1, 0)
                     )
+                    paged_tma_blocks_per_page = (
+                        mK.shape[0] // self.tile_n
+                        if const_expr(mPageTable is not None and self.use_tma_KV)
+                        else 1
+                    )
+                    n_block_clamped = cutlass.max(n_block, 0)
                     page_idx = (
-                        mPageTable[batch_idx, cutlass.max(n_block, 0)]
+                        mPageTable[
+                            batch_idx,
+                            n_block_clamped // paged_tma_blocks_per_page,
+                        ]
+                        * paged_tma_blocks_per_page
+                        + n_block_clamped % paged_tma_blocks_per_page
                         if const_expr(mPageTable is not None and self.use_tma_KV)
                         else None
                     )
@@ -1091,7 +1114,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                                 n_block = n_block_max - 1 - i - 1
                                 page_idx = (
-                                    mPageTable[batch_idx, n_block]
+                                    mPageTable[
+                                        batch_idx,
+                                        n_block // paged_tma_blocks_per_page,
+                                    ]
+                                    * paged_tma_blocks_per_page
+                                    + n_block % paged_tma_blocks_per_page
                                     if const_expr(mPageTable is not None and self.use_tma_KV)
                                     else None
                                 )
@@ -1119,12 +1147,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 n_block_prev = n_block_max - i - 1
                                 n_block = n_block_prev - 1
                                 page_idx = (
-                                    mPageTable[batch_idx, n_block]
+                                    mPageTable[
+                                        batch_idx,
+                                        n_block // paged_tma_blocks_per_page,
+                                    ]
+                                    * paged_tma_blocks_per_page
+                                    + n_block % paged_tma_blocks_per_page
                                     if const_expr(mPageTable is not None and self.use_tma_KV)
                                     else None
                                 )
                                 page_idx_prev = (
-                                    mPageTable[batch_idx, n_block_prev]
+                                    mPageTable[
+                                        batch_idx,
+                                        n_block_prev // paged_tma_blocks_per_page,
+                                    ]
+                                    * paged_tma_blocks_per_page
+                                    + n_block_prev % paged_tma_blocks_per_page
                                     if const_expr(mPageTable is not None and self.use_tma_KV)
                                     else None
                                 )
@@ -1158,7 +1196,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                     )
                             n_block = n_block_min
                             page_idx = (
-                                mPageTable[batch_idx, n_block]
+                                mPageTable[
+                                    batch_idx,
+                                    n_block // paged_tma_blocks_per_page,
+                                ]
+                                * paged_tma_blocks_per_page
+                                + n_block % paged_tma_blocks_per_page
                                 if const_expr(mPageTable is not None and self.use_tma_KV)
                                 else None
                             )
@@ -1630,7 +1673,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         seqlen=seqlen,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                         mask_fn=interior_mask_fn,
-                        check_inf=self.mask_mod is not None,
+                        check_inf=self.mask_mod is not None or self.score_mod is not None,
                     )
                     O_should_accumulate = True
                 # Separate iterations with local masking on the left
