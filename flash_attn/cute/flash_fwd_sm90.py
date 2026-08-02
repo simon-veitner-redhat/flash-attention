@@ -187,6 +187,38 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         return tiled_mma_qk, tiled_mma_pv, tiled_mma_qv
 
+    @cute.jit
+    def _gemm_two_stage(
+        self,
+        tiled_mma: cute.TiledMma,
+        acc: cute.Tensor,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+        B_idx: Int32,
+        zero_init: cutlass.Constexpr[bool] = False,
+        wg_wait: cutlass.Constexpr[int] = -1,
+    ) -> None:
+        """Issue WGMMA with a literal stage slice in each runtime branch."""
+        assert self.num_stages == 2
+        if B_idx == 0:
+            sm90_utils.gemm(
+                tiled_mma,
+                acc,
+                tCrA,
+                tCrB[None, None, None, 0],
+                zero_init=zero_init,
+                wg_wait=wg_wait,
+            )
+        else:
+            sm90_utils.gemm(
+                tiled_mma,
+                acc,
+                tCrA,
+                tCrB[None, None, None, 1],
+                zero_init=zero_init,
+                wg_wait=wg_wait,
+            )
+
     def _get_shared_storage_cls(self):
         sQ_struct, sK_struct, sV_struct = [
             cute.struct.Align[
@@ -1624,7 +1656,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_O, tOrP, tOrVt = sm90_utils.partition_fragment_ABC(
             wg_mma_pv, (self.tile_m, self.tile_hdimv, self.tile_n), sP, sVt
         )
-        mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
+        mma_pv_fn = (
+            partial(
+                self._gemm_two_stage,
+                tiled_mma_pv,
+                acc_O,
+                tOrP,
+                tOrVt,
+            )
+            if const_expr(self.has_qv)
+            else partial(
+                sm90_utils.gemm_w_idx,
+                tiled_mma_pv,
+                acc_O,
+                tOrP,
+                tOrVt,
+            )
+        )
         cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
         taccOcO_row = layout_utils.reshape_acc_to_mn(
             tiled_mma_pv.get_slice(tidx).partition_C(cO)
@@ -2496,11 +2544,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline_v.consumer_wait(
                 smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read)
             )
-            sm90_utils.gemm(
+            self._gemm_two_stage(
                 tiled_mma_qv,
                 acc_S,
                 tSrQv,
-                tSrV[None, None, None, smem_pipe_read.index],
+                tSrV,
+                smem_pipe_read.index,
                 zero_init=False,
                 wg_wait=-1,
             )
