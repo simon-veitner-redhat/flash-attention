@@ -1,9 +1,11 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Tuple
 from functools import lru_cache
+from types import SimpleNamespace
+from typing import Tuple
 
 import torch
+import tvm_ffi
 
 try:
     from triton.tools.disasm import extract
@@ -64,23 +66,29 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     if t is None:
         return None
-    if hasattr(t, "_cute_tensor"):
-        # Compile-only fake tensor. cutlass-dsl 4.6.0 removed mark_layout_dynamic()
-        # on fake tensors, so express the dynamic layout at construction instead
-        # (equivalent to from_dlpack(...).mark_layout_dynamic(leading_dim=...)).
-        cute_dtype = t._cute_tensor.element_type
+    if getattr(t, "_is_compile_only_tensor_spec", False):
+        # Compile-only tensor specs express their dynamic layout directly because
+        # cutlass-dsl 4.6.0 removed mark_layout_dynamic() on fake tensors.
+        cute_dtype = t.cute_element_type
+        ffi_dtype = t.ffi_element_type
         ndim = t.ndim
         if fully_dynamic:
             leading_dim = None
         elif leading_dim == -1:
             leading_dim = ndim - 1
         divisibility = max(1, assumed_align * 8 // cute_dtype.width) if assumed_align else 1
-        return fake_tensor(
+        tensor = fake_tensor(
             cute_dtype,
             tuple(cute.sym_int() for _ in range(ndim)),
             divisibility=divisibility,
             leading_dim=leading_dim,
         )
+        if ffi_dtype != cute_dtype:
+            tensor._tvm_ffi_tensor = SimpleNamespace(
+                dtype=tvm_ffi.dtype("uint8"),
+                device=SimpleNamespace(type="cuda", index=0),
+            )
+        return tensor
 
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type

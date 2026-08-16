@@ -12,7 +12,12 @@ import os
 import pytest
 import torch
 
-from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
+import flash_attn.cute.interface as cute_interface
+from flash_attn.cute.interface import (
+    _flash_attn_fwd,
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
 from flash_attn.cute.testing import (
     attention_ref,
     is_fake_mode,
@@ -418,7 +423,149 @@ def test_fp8_output_validation_errors():
     # SM80 / SM90 / SM120 reject FP8 output in each forward class's __init__.
     with pytest.raises(AssertionError, match="Fused quant output not implemented"):
         _flash_attn_fwd(q, k, v, out=out_fp8, output_scale=scale, _arch=80)
-    with pytest.raises(AssertionError, match="Fused quant output not implemented"):
+    with pytest.raises(AssertionError, match="SM90 does not support FP8 output"):
         _flash_attn_fwd(q, k, v, out=out_fp8, output_scale=scale, _arch=90)
     with pytest.raises(AssertionError, match="Fused quant output not implemented"):
         _flash_attn_fwd(q, k, v, out=out_fp8, output_scale=scale, _arch=120)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Generic FP8 admission mock requires CUDA tensors but no SM100 kernel.",
+)
+@pytest.mark.parametrize(
+    "input_dtype",
+    (torch.float8_e4m3fn, torch.float8_e5m2),
+    ids=("e4m3", "e5m2"),
+)
+def test_generic_fp8_descales_and_fused_output_reach_compile_and_dispatch(
+    monkeypatch, input_dtype
+):
+    """Exercise the SM100 host path on any CUDA GPU without compiling a kernel."""
+    batch, seqlen, num_heads, num_kv_heads, head_dim = 2, 5, 4, 2, 64
+    q = torch.zeros(
+        batch, seqlen, num_heads, head_dim, dtype=input_dtype, device="cuda"
+    )
+    k = torch.zeros(
+        batch, seqlen, num_kv_heads, head_dim, dtype=input_dtype, device="cuda"
+    )
+    v = torch.zeros_like(k)
+    descales = tuple(
+        torch.full(
+            (batch, num_kv_heads), value, dtype=torch.float32, device="cuda"
+        )
+        for value in (0.25, 0.5, 0.75)
+    )
+    output_scale = torch.tensor(0.125, dtype=torch.float32, device="cuda")
+    compile_cache = {}
+    forward_object = object()
+    forward_calls = []
+    compiled_calls = []
+    dispatched_args = []
+    converted_descales = {}
+    converted_output_scales = []
+    original_to_cute_tensor = cute_interface.to_cute_tensor
+
+    def fake_sm100_forward(*args, **kwargs):
+        forward_calls.append((args, kwargs))
+        return forward_object
+
+    def observe_conversion(t, *args, **kwargs):
+        converted = original_to_cute_tensor(t, *args, **kwargs)
+        for name, descale in zip(("q", "k", "v"), descales):
+            if t is descale:
+                converted_descales[name] = (converted, kwargs.copy())
+                break
+        if (
+            t is not None
+            and t.dtype == torch.float32
+            and t.numel() == 1
+            and t.data_ptr() == output_scale.data_ptr()
+        ):
+            converted_output_scales.append((converted, kwargs.copy()))
+        return converted
+
+    def fake_compile(*args, **kwargs):
+        compiled_calls.append((args, kwargs))
+
+        def dispatch(*runtime_args):
+            dispatched_args.append(runtime_args)
+
+        return dispatch
+
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", compile_cache)
+    monkeypatch.setattr(
+        cute_interface, "FlashAttentionForwardSm100", fake_sm100_forward
+    )
+    monkeypatch.setattr(cute_interface, "to_cute_tensor", observe_conversion)
+    monkeypatch.setattr(cute_interface.cute, "compile", fake_compile)
+
+    for omitted_idx in range(3):
+        call_descales = list(descales)
+        call_descales[omitted_idx] = None
+        _flash_attn_fwd(
+            q,
+            k,
+            v,
+            q_descale=call_descales[0],
+            k_descale=call_descales[1],
+            v_descale=call_descales[2],
+            output_scale=output_scale,
+            _arch=100,
+        )
+        assert len(compile_cache) == omitted_idx + 1
+
+    out, _, _, _ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        q_descale=descales[0],
+        k_descale=descales[1],
+        v_descale=descales[2],
+        output_scale=output_scale,
+        _arch=100,
+    )
+
+    assert out.dtype == torch.float8_e4m3fn
+    assert len(forward_calls) == len(compiled_calls) == len(dispatched_args) == 4
+    assert all(
+        call_kwargs["output_quant_key"] == "kFp8StaticTensorSym"
+        for _, call_kwargs in forward_calls
+    )
+    assert all(call_args[0] is forward_object for call_args, _ in compiled_calls)
+    assert all(
+        call_kwargs == {"options": "--enable-tvm-ffi"}
+        for _, call_kwargs in compiled_calls
+    )
+
+    assert len(compile_cache) == 4
+
+    assert set(converted_descales) == {"q", "k", "v"}
+    assert all(
+        conversion_kwargs == {"assumed_align": 4, "leading_dim": 1}
+        for _, conversion_kwargs in converted_descales.values()
+    )
+    compiled_descales = next(
+        arg
+        for arg in compiled_calls[-1][0]
+        if isinstance(arg, cute_interface.DescaleTensors)
+    )
+    runtime_descales = next(
+        arg
+        for arg in dispatched_args[-1]
+        if isinstance(arg, cute_interface.DescaleTensors)
+    )
+    for name, descale in zip(("q", "k", "v"), descales):
+        assert getattr(compiled_descales, f"{name}_descale") is (
+            converted_descales[name][0]
+        )
+        assert getattr(runtime_descales, f"{name}_descale") is descale
+
+    assert len(converted_output_scales) == 4
+    compiled_output_scale, conversion_kwargs = converted_output_scales[-1]
+    assert conversion_kwargs == {"assumed_align": 4, "leading_dim": 0}
+    assert any(arg is compiled_output_scale for arg in compiled_calls[-1][0])
+    runtime_output_scale = dispatched_args[-1][-1]
+    assert runtime_output_scale.shape == (1,)
+    assert runtime_output_scale.data_ptr() == output_scale.data_ptr()
+    assert runtime_output_scale.item() == output_scale.item()

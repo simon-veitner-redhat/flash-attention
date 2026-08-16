@@ -94,7 +94,9 @@ class SplitSchedulerPlanner:
             if self._host_workspace_event_recorded[slot] and not event.query():
                 event.synchronize()
             host_workspace = self._host_workspaces[slot]
-            host_workspace[:count].copy_(torch.tensor(counts, dtype=torch.int32))
+            host_workspace[:count].copy_(
+                torch.tensor(counts, dtype=torch.int32)
+            )
             self._workspace[:count].copy_(
                 host_workspace[:count],
                 non_blocking=True,
@@ -125,6 +127,8 @@ def plan_hopper_split_schedule(
     fast_build: bool = False,
 ) -> SplitSchedulePlan | None:
     """Return FA3-style SplitKV counts for measured Hopper Dense decode."""
+    if (head_dim, head_dim_v) not in ((128, 128), (256, 256)):
+        return None
     capability = torch.cuda.get_device_capability(device)
     if capability != (9, 0):
         return None
@@ -149,13 +153,11 @@ def plan_hopper_split_schedule(
         return None
     qheads_per_kvhead = math.ceil(num_heads_q / num_heads_kv)
     max_query_len = active_q_lens.max().item()
-    if head_dim == head_dim_v == 128:
+    if head_dim == 128:
         tile_m = 64 if max_query_len * qheads_per_kvhead <= 64 else 128
         tile_n = 128
-    elif head_dim == head_dim_v == 256:
-        tile_m, tile_n = 128, 80
     else:
-        return None
+        tile_m, tile_n = 128, 80
 
     keep_all_one_schedule = cuda_graph_max_num_splits is not None
     max_num_splits = cuda_graph_max_num_splits or 128

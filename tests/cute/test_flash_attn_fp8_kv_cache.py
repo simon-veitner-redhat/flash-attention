@@ -535,7 +535,7 @@ def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
     # runs fp16 matmuls (the same computation as the kernel under test).
     triton_output = _triton_unified_attention_ref(
         q16, ins["key_cache_fp8"], ins["value_cache_fp8"],
-        query_lens, kv_lens, ins["page_table"], q_scale, k_scale, v_scale,
+        query_lens, kv_lens, ins["page_table"], q_scale_one, k_scale, v_scale,
         torch.bfloat16,
     )
     # ---- FA4 CuTe fp16/bf16-Q + fp8-KV scale-fold SM90 forward (the kernel under test) ----
@@ -613,7 +613,7 @@ def test_gemma4_fp16q_fp8kv_dequant_splitkv_matches_reference(qo_dtype: torch.dt
     attention_case = next(
         c for c in ATTENTION_CASES if c.id == "gemma4_offline_lockstep_decode"
     )
-    scale_case = SCALE_CASES[0]  # default unity scales (matches the non-split smoke)
+    scale_case = SCALE_CASES[1]  # non-unity K/V scales exercise SplitKV final-scale folding
 
     ins = _build_case_inputs(attention_case, scale_case)
     query_lens = ins["query_lens"]
@@ -729,9 +729,10 @@ def _bench_make_fn(backend: str, ins: dict):
     if backend == "triton_fp16q":
         # fp16-Q Triton: dequantizes the fp8 cache to fp16 and runs fp16 matmuls (the
         # same computation as fa4_dequant) -- the apples-to-apples production oracle.
+        q_scale_one = torch.ones_like(ins["q_scale"])
         return lambda: _triton_unified_attention_ref(
             ins["query"].half(), ins["key_cache_fp8"], ins["value_cache_fp8"],
-            ql, kl, pt, ins["q_scale"], ins["k_scale"], ins["v_scale"],
+            ql, kl, pt, q_scale_one, ins["k_scale"], ins["v_scale"],
             output_dtype=torch.bfloat16,
         )
     if backend == "triton_fp8":
@@ -886,6 +887,7 @@ def _bench_capturable_fn(backend: str, ins: dict):
     q_descale_exp = (
         q_scale.reshape(1).expand(num_seqs, num_kv_heads).contiguous().float()
     )
+    q_descale_id = torch.ones_like(q_descale_exp)
 
     # Static, pre-allocated output buffer (stable pointer across replays). The
     # fp8 scale-fold path computes in fp16 and writes fp16 O (== compute dtype), so its
@@ -938,12 +940,8 @@ def _bench_capturable_fn(backend: str, ins: dict):
         q = ins["query"].half()  # fp16 (true precision; not query_fp8)
         k8 = ins["key_cache_fp8"]
         v8 = ins["value_cache_fp8"]
-        # Pre-built identity q_descale: fp16 Q needs no q-descale, and a STATIC tensor
-        # avoids interface.py materializing torch.ones(...) inside every graph replay
-        # (which would break cudagraph capture).
-        q_descale_id = torch.ones(
-            (num_seqs, num_kv_heads), device=device, dtype=torch.float32
-        )
+        # Reuse the pre-built identity q descale: fp16 Q needs no q descale, and
+        # the static tensor keeps graph replay allocation-free.
 
         def fn():
             _cute_flash_attn_fwd(
@@ -959,7 +957,7 @@ def _bench_capturable_fn(backend: str, ins: dict):
 
     if backend == "triton_fp16q":
         # fp16-Q Triton: Q_IS_FP8 is False -> dequantizes the fp8 cache to fp16 and runs
-        # fp16 matmuls (the apples-to-apples oracle for fa4_dequant). q_descale is unused here.
+        # fp16 matmuls (the apples-to-apples oracle for fa4_dequant).
         q = ins["query"].half()  # fp16
         k8 = ins["key_cache_fp8"]
         v8 = ins["value_cache_fp8"]
@@ -971,7 +969,7 @@ def _bench_capturable_fn(backend: str, ins: dict):
                 seqused_k=seqused, max_seqlen_k=mk,
                 softmax_scale=softmax_scale, causal=True,
                 window_size=(-1, -1), block_table=pt, softcap=0,
-                q_descale=q_descale_exp, k_descale=k_descale, v_descale=v_descale,
+                q_descale=q_descale_id, k_descale=k_descale, v_descale=v_descale,
                 kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
             )
 

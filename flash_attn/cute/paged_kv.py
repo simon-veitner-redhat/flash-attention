@@ -90,13 +90,12 @@ class PagedKVManager(ParamsBase):
         val_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = max(
-            1,
-            (
-                (n_block_size + num_threads - 1) // num_threads
-                if cache_v_ptr or aligned_page_size != 0
-                else n_block_size // num_threads
-            ),
+        cK = cute.make_identity_tensor((n_block_size, head_dim_padded))
+        tKcK = gmem_thr_copy_KV.partition_S(cK)
+        # load_KV consumes one page entry per gmem_threads_per_row rows in this
+        # thread's partition, including the partition's partial final group.
+        page_entry_per_thread = cute.ceil_div(
+            cute.size(tKcK, mode=[1]), gmem_threads_per_row
         )
         assert not cache_v_ptr or arch // 10 == 9
 
@@ -112,8 +111,6 @@ class PagedKVManager(ParamsBase):
         mK_paged = mK_paged[None, None, bidh, None]
         mV_paged = mV_paged[None, None, bidh, None]
 
-        cK = cute.make_identity_tensor((n_block_size, head_dim_padded))
-        tKcK = gmem_thr_copy_KV.partition_S(cK)
         tKpK = utils.predicate_k(tKcK, limit=mK_paged.shape[1])
 
         if const_expr(head_dim_padded == head_dim_v_padded):
