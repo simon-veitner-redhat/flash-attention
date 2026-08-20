@@ -387,7 +387,6 @@ def test_fp8_output_validation_errors():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cpu":
         pytest.skip("Validation calls into _flash_attn_fwd which expects CUDA tensors")
-    from flash_attn.cute.interface import _flash_attn_fwd
 
     q = torch.randn(2, 64, 4, 128, dtype=torch.bfloat16, device=device)
     k = torch.randn(2, 64, 4, 128, dtype=torch.bfloat16, device=device)

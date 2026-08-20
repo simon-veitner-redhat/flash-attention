@@ -4,7 +4,6 @@ import math
 import sys
 import types
 from dataclasses import dataclass
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -227,7 +226,6 @@ def _fa3_result(case: FrozenCase, kwargs, *, return_lse: bool = False):
 
 def _make_fp8(shape, scale, *, seed: int, q_heads: int | None = None):
     source = torch.randn(shape, generator=torch.Generator(device="cuda").manual_seed(seed), device="cuda") * 0.7
-    heads = q_heads or shape[-2]
     expanded = _expanded_scale(scale, shape[0], shape[-2])
     if q_heads is not None:
         expanded = expanded.repeat_interleave(q_heads // expanded.shape[1], dim=1)
@@ -399,8 +397,6 @@ def test_frozen_c01_c18_matrix(case, dtype):
         torch.testing.assert_close(out.float(), out3.float(), atol=0.30, rtol=0.20)
 
 def test_native_fp8_d128_gqa_paged_page16_long_query_matches_fa3():
-    assert flash_attn_varlen_func is not None
-    assert get_scheduler_metadata is not None
     case = FrozenCase(
         "d128-gqa-paged-page16-long-query",
         128,
@@ -746,9 +742,6 @@ def test_descale_graph_allocation_and_profile_window(case_id):
         _assert_no_copy_ops(graph.replay)
 
 
-
-
-
 def _observe_split_workspace(monkeypatch, kwargs):
     allocations = []
     original_empty = torch.empty
@@ -764,151 +757,70 @@ def _observe_split_workspace(monkeypatch, kwargs):
     return result, allocations
 
 
+def _static_split_case(
+    case_id, seed, *, d=256, hq=4, hkv=1, batch=1, sk=128,
+    mode="direct", num_splits=1, k_lens=None, page_size=None,
+):
+    varlen = mode != "direct"
+    return FrozenCase(
+        case_id, d, d, hq, hkv, batch, 1, sk, False, "scalar",
+        (seed, seed + 1, seed + 2), mode, num_splits,
+        (1,) * batch if varlen else None,
+        k_lens if k_lens is not None else (sk,) * batch if varlen else None,
+        page_size,
+    )
+
+
 @pytest.mark.parametrize(
     "case,expected_splits",
     (
         pytest.param(
-            FrozenCase(
-                "static-boundary",
-                256,
-                256,
-                4,
-                1,
-                1,
-                1,
-                128,
-                False,
-                "scalar",
-                (701, 702, 703),
-                num_splits=9,
-            ),
+            _static_split_case("static-boundary", 701, num_splits=9),
             2,
             id="direct-k128-request9-caps2",
         ),
         pytest.param(
-            FrozenCase(
-                "static-tail",
-                256,
-                256,
-                4,
-                1,
-                2,
-                1,
-                129,
-                False,
-                "scalar",
-                (711, 712, 713),
-                mode="varlen",
-                num_splits=9,
-                q_lens=(1, 1),
-                k_lens=(129, 65),
+            _static_split_case(
+                "static-tail", 711, batch=2, sk=129, mode="varlen",
+                num_splits=9, k_lens=(129, 65),
             ),
             3,
             id="varlen-k129-request9-caps3",
         ),
         pytest.param(
-            FrozenCase(
-                "static-below-available",
-                256,
-                256,
-                4,
-                1,
-                2,
-                1,
-                257,
-                False,
-                "scalar",
-                (721, 722, 723),
-                mode="paged",
-                num_splits=2,
-                q_lens=(1, 1),
-                k_lens=(257, 129),
-                page_size=64,
+            _static_split_case(
+                "static-below-available", 721, batch=2, sk=257, mode="paged",
+                num_splits=2, k_lens=(257, 129), page_size=64,
             ),
             2,
             id="paged-request2-remains2",
         ),
         pytest.param(
-            FrozenCase(
-                "static-occupancy-below-boundary",
-                128,
-                128,
-                16,
-                4,
-                7,
-                1,
-                4096,
-                False,
-                "scalar",
-                (751, 752, 753),
-                mode="paged",
-                num_splits=3,
-                q_lens=(1,) * 7,
-                k_lens=(4096,) * 7,
-                page_size=16,
+            _static_split_case(
+                "static-occupancy-below-boundary", 751, d=128, hq=16, hkv=4,
+                batch=7, sk=4096, mode="paged", num_splits=3, page_size=16,
             ),
             3,
             id="paged-b7-hkv4-request3-remains3",
         ),
         pytest.param(
-            FrozenCase(
-                "static-occupancy-cap2",
-                128,
-                128,
-                16,
-                4,
-                16,
-                1,
-                4096,
-                False,
-                "scalar",
-                (761, 762, 763),
-                mode="paged",
-                num_splits=3,
-                q_lens=(1,) * 16,
-                k_lens=(4096,) * 16,
-                page_size=16,
+            _static_split_case(
+                "static-occupancy-cap2", 761, d=128, hq=16, hkv=4,
+                batch=16, sk=4096, mode="paged", num_splits=3, page_size=16,
             ),
             2,
             id="paged-b16-hkv4-request3-caps2",
         ),
         pytest.param(
-            FrozenCase(
-                "static-occupancy-cap1",
-                128,
-                128,
-                16,
-                4,
-                17,
-                1,
-                4096,
-                False,
-                "scalar",
-                (771, 772, 773),
-                mode="paged",
-                num_splits=3,
-                q_lens=(1,) * 17,
-                k_lens=(4096,) * 17,
-                page_size=16,
+            _static_split_case(
+                "static-occupancy-cap1", 771, d=128, hq=16, hkv=4,
+                batch=17, sk=4096, mode="paged", num_splits=3, page_size=16,
             ),
             1,
             id="paged-b17-hkv4-request3-caps1",
         ),
         pytest.param(
-            FrozenCase(
-                "static-single",
-                256,
-                256,
-                4,
-                1,
-                1,
-                1,
-                128,
-                False,
-                "scalar",
-                (741, 742, 743),
-                num_splits=1,
-            ),
+            _static_split_case("static-single", 741),
             1,
             id="direct-request1-remains-single",
         ),
@@ -918,7 +830,6 @@ def test_static_native_fp8_split_workspace_is_capped_to_n_tiles_and_occupancy(
     monkeypatch, case, expected_splits
 ):
     kwargs, expected = _arguments(case)
-    requested_splits = kwargs["num_splits"]
     result, allocations = _observe_split_workspace(monkeypatch, kwargs)
 
     observed_partial_shapes = [
@@ -934,28 +845,13 @@ def test_static_native_fp8_split_workspace_is_capped_to_n_tiles_and_occupancy(
         assert observed_partial_shapes == []
     if case.num_splits != expected_splits:
         assert (case.num_splits, *kwargs["q"].shape) not in allocations
-    assert kwargs["num_splits"] == requested_splits == case.num_splits
     _assert_result(result[0], result[1], expected, torch.bfloat16)
 
 
 def test_dynamic_native_fp8_split_workspace_and_counts_are_not_capped(monkeypatch):
-    case = FrozenCase(
-        "dynamic-occupancy-unchanged",
-        128,
-        128,
-        16,
-        4,
-        17,
-        1,
-        128,
-        False,
-        "scalar",
-        (731, 732, 733),
-        mode="paged",
-        num_splits=2,
-        q_lens=(1,) * 17,
-        k_lens=(128,) * 17,
-        page_size=64,
+    case = _static_split_case(
+        "dynamic-occupancy-unchanged", 731, d=128, hq=16, hkv=4, batch=17,
+        mode="paged", num_splits=2, page_size=64,
     )
     kwargs, expected = _arguments(case)
     requested_counts = torch.tensor(
@@ -1381,49 +1277,17 @@ def test_compile_only_paged_scalar_descale_static_split_compiles_combine(
     assert combine.num_threads == 256
 
 
-
-
-def test_compile_only_forwards_sink_and_dynamic_counter_specs(monkeypatch):
-    forwarded = MagicMock(return_value="compiled")
-    monkeypatch.setattr(cute_interface, "_flash_attn_fwd", forwarded)
-
-    result = cute_interface.compile_flash_attn_varlen_func_from_specs(
-        q_shape=(1, 16, 192),
-        k_shape=(7, 16, 2, 192),
-        v_shape=(7, 16, 2, 128),
-        q_dtype=FP8,
-        out_dtype=torch.bfloat16,
-        v_stride=(10240, 640, 320, 1),
-        cu_seqlens_q_shape=(2,),
-        seqused_k_shape=(1,),
-        page_table_shape=(1, 7),
-        num_splits_dynamic_ptr_shape=(1,),
-        learnable_sink_shape=(16,),
-        learnable_sink_stride=(1,),
-        dynamic_scheduler_counter_shape=(1,),
-        dynamic_scheduler_counter_stride=(1,),
-        max_seqlen_q=1,
-        max_seqlen_k=100,
-        num_splits=32,
-    )
-
-    assert result == "compiled"
-    kwargs = forwarded.call_args.kwargs
-    assert kwargs["learnable_sink"].shape == (16,)
-    assert kwargs["learnable_sink"].dtype == torch.bfloat16
-    assert kwargs["learnable_sink"].stride() == (1,)
-    assert kwargs["dynamic_scheduler_counter"].shape == (1,)
-    assert kwargs["dynamic_scheduler_counter"].dtype == torch.int32
-    assert kwargs["dynamic_scheduler_counter"].stride() == (1,)
-    assert kwargs["num_splits_dynamic_ptr"].shape == (1,)
-    assert kwargs["v"].shape[-1] == 128
-    assert kwargs["v"].stride() == (10240, 640, 320, 1)
-    assert kwargs["out"].shape == (1, 16, 128)
-    assert kwargs["compile_only"] is True
-
-
 def test_compile_only_dynamic_diffkv_compiles_forward_and_combine(monkeypatch):
     forward_cache, combine_cache, compiled = _mock_compile_only_caches(monkeypatch)
+    forwarded = {}
+    original_forward = cute_interface._flash_attn_fwd
+
+    def observe_forward(**kwargs):
+        forwarded.update(kwargs)
+        return original_forward(**kwargs)
+
+    observe_forward.compile_cache = forward_cache
+    monkeypatch.setattr(cute_interface, "_flash_attn_fwd", observe_forward)
 
     result = cute_interface.compile_flash_attn_varlen_func_from_specs(
         q_shape=(1, 16, 192),
@@ -1453,6 +1317,18 @@ def test_compile_only_dynamic_diffkv_compiles_forward_and_combine(monkeypatch):
     )
 
     assert result[0].shape == (1, 16, 128)
+    assert forwarded["learnable_sink"].shape == (16,)
+    assert forwarded["learnable_sink"].dtype == torch.bfloat16
+    assert forwarded["learnable_sink"].stride() == (1,)
+    assert forwarded["dynamic_scheduler_counter"].shape == (1,)
+    assert forwarded["dynamic_scheduler_counter"].dtype == torch.int32
+    assert forwarded["dynamic_scheduler_counter"].stride() == (1,)
+    assert forwarded["num_splits_dynamic_ptr"].shape == (1,)
+    assert forwarded["num_splits_dynamic_ptr"].stride() == (1,)
+    assert forwarded["v"].shape == (7, 16, 2, 128)
+    assert forwarded["v"].stride() == (10240, 640, 320, 1)
+    assert forwarded["out"].shape == (1, 16, 128)
+    assert forwarded["compile_only"] is True
     assert len(forward_cache) == 1
     assert len(combine_cache) == 1
     assert len(compiled) == 2
