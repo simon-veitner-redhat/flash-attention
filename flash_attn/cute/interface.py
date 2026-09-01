@@ -401,6 +401,7 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    gather_kv_valid_length: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
     compile_only: bool = False,
     fp8_kv_dequant: bool = False,
@@ -905,6 +906,18 @@ def _flash_attn_fwd(
             #     seqlen_k_boundary = min_seqlen_k
             #     disable_sparse_kv_bitmask = seqlen_k_boundary >= gather_kv_length
         
+        if gather_kv_valid_length is not None:
+            assert sparse_kv, "gather_kv_valid_length requires gather_kv_indices"
+            # The early exit rounds the length up to a whole n-block, so the tail of
+            # the last block is attended and only the sentinel bitmask filters it.
+            assert not disable_sparse_kv_bitmask, (
+                "gather_kv_valid_length requires the sparse KV bitmask"
+            )
+            assert gather_kv_valid_length.shape == gather_kv_indices.shape[:-1]
+            assert gather_kv_valid_length.dtype == torch.int32
+            assert gather_kv_valid_length.stride(-1) == 1
+            assert not requires_grad, "gather_kv_valid_length is forward-only"
+
         if requires_grad and sparse_kv:
             if cu_seqlens_q is None:
                 p = torch.empty(batch_size, seqlen_q, num_head, gather_kv_length, dtype=q_dtype, device=device)
@@ -916,6 +929,7 @@ def _flash_attn_fwd(
             p = row_max = None
     else:
         assert gather_kv_indices is None, "gather_kv_indices is only supported with qv"
+        assert gather_kv_valid_length is None, "gather_kv_valid_length is only supported with qv"
         gather_kv_length = None
         sparse_kv = None
         disable_sparse_kv_bitmask = None
@@ -966,6 +980,7 @@ def _flash_attn_fwd(
         row_max is not None,
         gather_kv_length,
         sparse_kv,
+        gather_kv_valid_length is not None,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         output_quant_key,
@@ -1051,6 +1066,7 @@ def _flash_attn_fwd(
 
         qv_tensor = to_cute_tensor(qv)
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices)
+        gather_kv_valid_length_tensor = to_cute_tensor(gather_kv_valid_length, assumed_align=4)
         p_tensor = to_cute_tensor(p)
         row_max_tensor = to_cute_tensor(row_max)
 
@@ -1243,6 +1259,7 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 dynamic_causal_tensor,
                 gather_kv_indices_tensor,
+                gather_kv_valid_length_tensor,
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
@@ -1332,6 +1349,7 @@ def _flash_attn_fwd(
                 seqused_k,
                 dynamic_causal,
                 gather_kv_indices,
+                gather_kv_valid_length,
                 page_table,
                 window_size_left,
                 window_size_right,
@@ -2720,6 +2738,7 @@ class FlashAttnFunc(torch.autograd.Function):
         v: torch.Tensor,
         qv: Optional[torch.Tensor] = None,
         gather_kv_indices: Optional[torch.Tensor] = None,
+        gather_kv_valid_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
@@ -2767,6 +2786,7 @@ class FlashAttnFunc(torch.autograd.Function):
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            gather_kv_valid_length=gather_kv_valid_length,
             out=out,
             output_scale=output_scale,
         )
@@ -2854,6 +2874,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_k: Optional[int] = None,
         min_seqlen_k: Optional[int] = None,
         gather_kv_indices: Optional[torch.Tensor] = None,
+        gather_kv_valid_length: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
@@ -2909,6 +2930,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             aux_scalars=aux_scalars,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            gather_kv_valid_length=gather_kv_valid_length,
             out=out,
             output_scale=output_scale,
         )
@@ -3015,6 +3037,7 @@ def flash_attn_func(
     v: torch.Tensor,
     qv: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    gather_kv_valid_length: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
@@ -3040,6 +3063,7 @@ def flash_attn_func(
         v,
         qv,
         gather_kv_indices,
+        gather_kv_valid_length,
         softmax_scale,
         causal,
         window_size,
@@ -3074,6 +3098,7 @@ def flash_attn_varlen_func(
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    gather_kv_valid_length: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -3103,6 +3128,7 @@ def flash_attn_varlen_func(
         cu_seqlens_k: (batch + 1)       or seqused_k: (batch)
         gather_kv_indices: (total_q, gather_kv_length) or
                            (batch, seqlen_q, gather_kv_length)
+        gather_kv_valid_length: (total_q,) or (batch, seqlen_q), int32
         page_table: (batch, max_num_pages_per_seq)
     
     Return:
@@ -3120,6 +3146,13 @@ def flash_attn_varlen_func(
         so we arrange for nheads as the contiguous mode for better vectorization.
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
+
+    gather_kv_valid_length: per-query-row count of leading entries of gather_kv_indices
+        that may contain a valid index; the kernel stops after
+        ceil(valid_length / 128) index blocks. Entries at or beyond valid_length must be
+        invalid (negative, or >= the row's seqlen_k), because the tail of the last block
+        is still gathered and is only filtered by the -1 bitmask. Rows with
+        valid_length == 0 still run one block and produce out=0, lse=-inf.
     """
     return FlashAttnVarlenFunc.apply(
         q,
@@ -3134,6 +3167,7 @@ def flash_attn_varlen_func(
         max_seqlen_k,
         min_seqlen_k,
         gather_kv_indices,
+        gather_kv_valid_length,
         page_table,
         softmax_scale,
         causal,
