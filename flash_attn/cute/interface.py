@@ -1015,8 +1015,6 @@ def _flash_attn_fwd(
         and q_dtype in (torch.float16, torch.bfloat16)
         and seqused_q is None
         and page_table is None
-        and lse is None
-        and not return_lse
         and not requires_grad
         and not causal
         and not local
@@ -1982,7 +1980,7 @@ def _flash_attn_fwd(
                 out_partial.unsqueeze(1),                    # (S, 1, total_q, h, dv)
                 lse_partial.unsqueeze(1).transpose(-1, -2),  # (S, 1, total_q, h), stride[2] == 1
                 out.unsqueeze(0),                            # (1, total_q, h, dv)
-                None,                                        # lse
+                lse.unsqueeze(0) if lse is not None else None,  # (1, total_q, h)
                 None,                                        # cu_seqlens
                 None,                                        # seqused
                 output_scale=output_scale,
@@ -4068,7 +4066,7 @@ def compile_flash_attn_varlen_func_from_specs(
 
 def _compile_fwd_combine(
     _arch, dtype, dtype_partial, head_dim, num_head, tile_m, k_block_size, log_max_splits,
-    has_cu_seqlens, has_seqused, has_lse, has_virtual_batch_idx,
+    has_cu_seqlens, has_seqused, lse_leading_dim, has_virtual_batch_idx,
     has_num_splits_dynamic, has_semaphore_to_reset, output_quant_key,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
@@ -4099,14 +4097,22 @@ def _compile_fwd_combine(
         mO_partial = fake_tensor(dtype_partial, (num_splits, total_q, nheads, head_dim), divisibility=div)
         mLSE_partial = fake_tensor(Float32, (num_splits, total_q, nheads), divisibility=1, leading_dim=1)
         mO = fake_tensor(dtype, (total_q, nheads, head_dim), divisibility=div)
-        mLSE = fake_tensor(Float32, (total_q, nheads), divisibility=1, leading_dim=0) if has_lse else None
+        mLSE = (
+            fake_tensor(Float32, (total_q, nheads), divisibility=1, leading_dim=lse_leading_dim)
+            if lse_leading_dim is not None
+            else None
+        )
     else:
         # Batched: (num_splits, batch, seqlen, nheads, headdim)
         num_splits, batch, seqlen, nheads = sym(), sym(), sym(), sym()
         mO_partial = fake_tensor(dtype_partial, (num_splits, batch, seqlen, nheads, head_dim), divisibility=div)
         mLSE_partial = fake_tensor(Float32, (num_splits, batch, seqlen, nheads), divisibility=1, leading_dim=2)
         mO = fake_tensor(dtype, (batch, seqlen, nheads, head_dim), divisibility=div)
-        mLSE = fake_tensor(Float32, (batch, seqlen, nheads), divisibility=1, leading_dim=1) if has_lse else None
+        mLSE = (
+            fake_tensor(Float32, (batch, seqlen, nheads), divisibility=1, leading_dim=lse_leading_dim)
+            if lse_leading_dim is not None
+            else None
+        )
         batch = mO_partial.shape[1]
 
     batch_for_1d = batch if not has_cu_seqlens else sym()
@@ -4205,6 +4211,18 @@ def _flash_attn_fwd_combine(
     # Create combine kernel configuration
     dtype = torch2cute_dtype_map[out.dtype]
     dtype_partial = torch2cute_dtype_map[out_partial.dtype]
+    # the final LSE store is scalar, so either dim may be contiguous (heads for MLA decode)
+    lse_leading_dim = (
+        None
+        if lse is None
+        else next(
+            (
+                i for i in reversed(range(lse.dim()))
+                if lse.shape[i] > 1 and lse.stride(i) == 1
+            ),
+            0 if cu_seqlens is not None else 1,
+        )
+    )
     compile_key = (
         _get_device_arch() if _arch is None else _arch,
         dtype,
@@ -4216,7 +4234,7 @@ def _flash_attn_fwd_combine(
         log_max_splits,
         cu_seqlens is not None,
         seqused is not None,
-        lse is not None,
+        lse_leading_dim,
         virtual_batch_idx is not None,
         num_splits_dynamic_ptr is not None,
         semaphore_to_reset is not None,

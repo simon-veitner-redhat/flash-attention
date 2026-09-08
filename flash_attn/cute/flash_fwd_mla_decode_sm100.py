@@ -176,7 +176,7 @@ class FlashAttentionMLADecodeSm100:
         mK: cute.Tensor,              # (total_k, h_k, 64)
         mV: cute.Tensor,              # (total_k, h_k, 512)
         mO: cute.Tensor,              # (total_q, h, 512)  or (S, total_q, h, 512) fp32
-        mLSE: Optional[cute.Tensor],  # (S, h, total_q), None when S == 1
+        mLSE: Optional[cute.Tensor],  # (S, h, total_q) split, (total_q, h) unsplit, None if unused
         softmax_scale: Float32,
         mCuSeqlensQ: cute.Tensor,
         mIndexTopk: cute.Tensor,                      # (total_q, topk)
@@ -831,13 +831,16 @@ class FlashAttentionMLADecodeSm100:
             rs = sSmSum[ctid]
             bad = rs == 0.0 or rs != rs
             sInv[ctid] = cute.arch.rcp_approx(rs if not bad else Float32(1.0))
-            if const_expr(self.is_split_kv):
+            if const_expr(mLSE is not None):
                 lse = (
                     (sSmMax[ctid] * softmax_scale_log2 + cute.math.log2(rs, fastmath=True)) * LN2
                     if not bad
                     else -Float32.inf
                 )
-                mLSE[m_idx, head_base + ctid, split_idx] = lse
+                if const_expr(self.is_split_kv):
+                    mLSE[m_idx, head_base + ctid, split_idx] = lse
+                else:
+                    mLSE[m_idx, head_base + ctid] = lse
         bar_corr.arrive_and_wait()
 
         fa_sm100_utils.fence_tcgen05_after_thread_sync()
