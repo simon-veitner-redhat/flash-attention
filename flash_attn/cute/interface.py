@@ -350,7 +350,7 @@ def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_block
     head_groups = next(g for g in (1, 2, 4, 8) if qhead_per_kvhead // g in supported)
     ctas = total_q * nheads_kv * head_groups
     # minimize waves per split, with at least two blocks per split and at most one extra wave
-    # (the kernel balances a block count the split count does not divide, e.g. 17 = 2*7 + 3)
+    # (the kernel balances a block count the split count does not divide: 17 over 8 -> 7x2 + 3)
     splits, best_cost, candidate = 1, waves(ctas), 2
     while (
         num_n_blocks // candidate >= 2
@@ -1472,7 +1472,6 @@ def _flash_attn_fwd(
         # fp8_kv_dequant forces compute dtype = fp16, so the Q/O tensor dtypes (which the
         # kernel derives from mQ/mO and which select the in-kernel narrow/widen) are no
         # longer captured by `dtype` above -- key on them explicitly. Redundant elsewhere.
-        # q_dtype, not q.dtype: q is None on the rope-less MLA paths.
         q_dtype,
         out_torch_dtype,
         # the decode kernel is a different class with a different grid and smem plan
@@ -3964,8 +3963,7 @@ def flash_attn_varlen_func(
 
     gather_kv_valid_length: leading valid entries per row; entries past it must be out of range.
 
-    q and k may be None for rope-less absorbed MLA (head_dim is then taken from qv); on the
-        top-k decode path this selects the rope-less kernel variant.
+    q and k may be None for rope-less absorbed MLA (head_dim then comes from qv).
     """
     return FlashAttnVarlenFunc.apply(
         q,

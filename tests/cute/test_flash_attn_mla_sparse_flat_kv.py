@@ -80,10 +80,7 @@ def make_indices(valid_counts, num_rows, device, seed=2, topk=TOPK, pad=-1):
 
 
 def ref_sparse_mla(q, qv, kv, idx, valid_counts, softmax_scale=SOFTMAX_SCALE, upcast=True):
-    """Pure-torch attention over the gathered rows. Returns (out, lse) with lse in natural log.
-
-    `q is None` is the rope-less (NoPE) shape: the score is qv @ v_g.T alone.
-    """
+    """Pure-torch attention over the gathered rows. Returns (out, lse) with lse in natural log."""
     total_q, heads = qv.shape[0], qv.shape[1]
     compute_dtype = torch.float32 if upcast else qv.dtype
     out = torch.zeros(total_q, heads, KV_LORA_RANK, device=qv.device, dtype=qv.dtype)
@@ -96,13 +93,10 @@ def ref_sparse_mla(q, qv, kv, idx, valid_counts, softmax_scale=SOFTMAX_SCALE, up
         assert (rows >= 0).all() and (rows < kv.shape[0]).all()
         kv_g = kv[rows, 0, :].to(compute_dtype)  # (n, KV_LORA_RANK + rope)
         v_g, k_g = kv_g[:, :KV_LORA_RANK], kv_g[:, KV_LORA_RANK:]
+        scores = qv[m].to(compute_dtype) @ v_g.transpose(0, 1)
         if q is not None:
-            scores = (
-                q[m].to(compute_dtype) @ k_g.transpose(0, 1)
-                + qv[m].to(compute_dtype) @ v_g.transpose(0, 1)
-            ) * softmax_scale
-        else:
-            scores = (qv[m].to(compute_dtype) @ v_g.transpose(0, 1)) * softmax_scale
+            scores = scores + q[m].to(compute_dtype) @ k_g.transpose(0, 1)
+        scores = scores * softmax_scale
         scores = scores.float()
         lse[m] = torch.logsumexp(scores, dim=-1)
         p = torch.softmax(scores, dim=-1).to(compute_dtype)

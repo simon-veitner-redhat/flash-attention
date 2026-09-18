@@ -109,7 +109,7 @@ def test_decode_without_valid_length(dtype, num_heads):
 
 
 # (num_heads, total_q, topk): one per (per-CTA h, num_splits) band the split rule yields
-# at 148 SMs for the rope-less shape. 2176 == 17 x 128 is prime, so it never splits.
+# at 148 SMs for the rope-less shape. topk 2176 is 34 blocks of 64, so its splits are uneven.
 NOPE_BANDS = [
     (8, 9, 2048),     # h 8,  S 8
     (16, 37, 2048),   # h 16, S 4
@@ -117,10 +117,10 @@ NOPE_BANDS = [
     (32, 74, 2048),   # h 32, S 2
     (32, 148, 2048),  # h 32, S 1
     (64, 1, 2048),    # 64 heads -> 8 head groups
-    (8, 9, 2176),     # h 8,  S 1
-    (16, 148, 2176),  # h 16, S 1
+    (8, 9, 2176),     # h 8,  S 8
+    (16, 37, 2176),   # h 16, S 4
     (32, 148, 2176),  # h 32, S 1
-    (64, 19, 2176),   # h 16, S 1
+    (64, 19, 2176),   # h 32, S 2 (2 head groups)
 ]
 
 

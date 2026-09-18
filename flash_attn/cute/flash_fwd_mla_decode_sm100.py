@@ -1,10 +1,5 @@
 # Copyright (c) 2026, Colfax International.
-"""SM100 sparse-MLA (DSA) decode kernel: the gathered KV tile is the A operand of both MMAs.
-
-The rope stream is a compile-time parameter: `hdim_rope=64` is the DeepSeek 64/512 absorbed
-shape, `hdim_rope=0` the rope-less (NoPE) absorbed shape whose query and KV rows are both 512
-wide.  Every rope site is gated on `self.has_rope`; nothing else differs between the two.
-"""
+"""SM100 sparse-MLA (DSA) decode kernel: the gathered KV tile is the A operand of both MMAs."""
 
 import math
 import operator
@@ -31,13 +26,11 @@ from flash_attn.cute.utils import elem_pointer, get_batch_from_cu_tensor, warp_r
 LOG2_E = math.log2(math.e)
 LN2 = math.log(2.0)
 
-SMEM_CAP_BYTES = 232448
+SMEM_CAP_BYTES = 232448  # the measured SM100 dynamic-smem ceiling
 # rope 0 (tile 64, 16 KiB stages): latent ring depth per per-CTA head count
-_RING_NOPE = {8: 12, 16: 12, 32: 11}  # the measured SM100 dynamic-smem ceiling
+_RING_NOPE = {8: 12, 16: 12, 32: 11}
 
 # h -> (latent ring depth, P^T aliased onto the rope ring).  n_rope = n_pt = 1 always.
-# The alias applies only when there is a rope ring to alias onto; with hdim_rope == 0 the
-# h == 16 entry falls back to a real sPt allocation (which fits: see __call__'s smem assert).
 _RING = {8: (6, False), 16: (6, True), 32: (5, False)}
 
 
@@ -72,10 +65,8 @@ class FlashAttentionMLADecodeSm100:
         self.hdimv = 512
         self.hdim_total = self.hdimv + self.hdim_rope  # [latent 0..511][rope 512..575]
 
-        # rope 0: 64-row blocks so that two blocks fit the latent ring at once (cross-block
-        # pipelining); the top-k indices are still read in 128-row pairs (gather_tile)
+        # rope 0: 64-row blocks so two blocks fit the latent ring at once (cross-block pipelining)
         self.tile_n = 128 if self.has_rope else 64
-        self.gather_tile = 128
         self.dv_chunk = 128
         self.num_chunks = self.hdimv // self.dv_chunk  # 4
 
@@ -86,9 +77,6 @@ class FlashAttentionMLADecodeSm100:
         self.is_split_kv = num_splits > 1
         self.n_blocks_full = n_blocks_full
         self.num_splits = num_splits
-        # Equal windows when the block count divides; otherwise balanced windows
-        # [s * n // S, (s + 1) * n // S) (e.g. 17 blocks over 8 splits: 2,2,2,2,2,2,2,3).
-        self.even_splits = n_blocks_full % num_splits == 0
         self.blocks_per_split = n_blocks_full // num_splits
         # head group fastest: the G CTAs that gather the SAME top-k rows stay co-resident
         self.num_ctas_per_token = num_head_groups * num_splits
@@ -222,10 +210,7 @@ class FlashAttentionMLADecodeSm100:
         dtype = mV.element_type
         assert dtype in (cutlass.Float16, cutlass.BFloat16), "sparse decode requires 16-bit KV"
         self.dtype_O = mO.element_type
-        if const_expr(self.has_rope):
-            assert mQ is not None and mK is not None, "hdim_rope=64 needs the rope Q and K"
-        else:
-            assert mQ is None and mK is None, "hdim_rope=0 (NoPE) takes no rope Q or K"
+        assert (mQ is not None) == (mK is not None) == self.has_rope, "rope Q/K iff hdim_rope"
 
         new_stride = lambda mX: (
             *(cute.assume(s, divby=128 // mX.element_type.width) for s in mX.stride[:-1]),
@@ -363,7 +348,8 @@ class FlashAttentionMLADecodeSm100:
         if const_expr(not self.is_split_kv):
             n_block_lo = Int32(0)
             num_n_blocks = n_valid_blocks
-        elif const_expr(self.even_splits):
+        # equal windows when the splits divide the blocks, balanced [s*n//S, (s+1)*n//S) otherwise
+        elif const_expr(self.n_blocks_full % self.num_splits == 0):
             # a split entirely past the valid window still walks one all-masked block
             n_block_lo = split_idx * Int32(self.blocks_per_split)
             num_n_blocks = max(
@@ -380,7 +366,7 @@ class FlashAttentionMLADecodeSm100:
         storage = smem.allocate(SharedStorage)
 
         lat_ptr = storage.sLat.data_ptr()
-        rope_ptr = storage.sRope.data_ptr()  # zero-length MemRange when hdim_rope == 0
+        rope_ptr = storage.sRope.data_ptr()
         sLatK = cute.make_tensor(cute.recast_ptr(lat_ptr, LlatK.inner, dtype), LlatK.outer)
         sLatMN = cute.make_tensor(cute.recast_ptr(lat_ptr, LlatMN.inner, dtype), LlatMN.outer)
         sRope = (
@@ -496,7 +482,7 @@ class FlashAttentionMLADecodeSm100:
             self.softmax_loop(
                 mIndexTopk, mma_S, accS, sRed, sSmMax, sSmSum, sScale, sPt,
                 pl_S, pl_P, pl_stats, tidx, warp_idx, m_idx, seqlen_k_limit,
-                softmax_scale_log2, n_block_lo, num_n_blocks, mma_O,
+                softmax_scale_log2, n_block_lo, num_n_blocks,
                 accS1 if const_expr(not self.has_rope) else None,
             )
         elif warp_idx < self.mma_warp_id:
@@ -543,7 +529,7 @@ class FlashAttentionMLADecodeSm100:
             warp_idx - self.gather_warp_lo,
             self.topk_length,
             seqlen_k_limit,
-            self.gather_tile,
+            128,  # gather tile: create needs tile_n % num_threads == 0
             self.hdim_rope,
             self.hdimv,
             self.num_chunks,  # num_hdimv_splits: one hdim_v split per latent chunk
@@ -579,9 +565,8 @@ class FlashAttentionMLADecodeSm100:
                 pl_rope.sync_object_full.arrive_cp_async_mbarrier(ps_rope.index)
                 ps_rope.advance()
         else:
-            # 64-row blocks: each gather thread reads the four indices of the rows it copies
-            # and builds their pointers once per block, so the four chunk copies need no
-            # per-row index shuffles (the pointer and the validity flag stay in registers)
+            # 64-row blocks: each gather thread builds its four row pointers once per block,
+            # so the four chunk copies need no per-row index or pointer shuffles
             n_block_last = n_block_lo + num_n_blocks - 1
             mgr.prefetch_row_index(n_block_lo * Int32(self.tile_n))
             for n_block in cutlass.range(num_n_blocks, unroll=1):
@@ -593,7 +578,7 @@ class FlashAttentionMLADecodeSm100:
                     pl_lat.producer_acquire(ps_lat)
                     mgr.load_X(
                         mV_cur, sLatK[None, None, None, ps_lat.index], False, "V",
-                        c * self.dv_chunk, rows=self.tile_n, direct=True,
+                        c * self.dv_chunk, direct_rows=self.tile_n,
                     )
                     cute.arch.cp_async_commit_group()
                     pl_lat.sync_object_full.arrive_cp_async_mbarrier(ps_lat.index)
@@ -611,9 +596,9 @@ class FlashAttentionMLADecodeSm100:
         pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
     ):
         tSrLat = mma_S.make_fragment_A(sLatK)
-        tSrRope = mma_S.make_fragment_A(sRope) if const_expr(self.has_rope) else None
+        tSrRope = mma_S.make_fragment_A(sRope)
         tSrQtC = mma_S.make_fragment_B(sQtC)
-        tSrQtR = mma_S.make_fragment_B(sQtR) if const_expr(self.has_rope) else None
+        tSrQtR = mma_S.make_fragment_B(sQtR)
         tOrLat = mma_O.make_fragment_A(sLatMN)
         tOrPt = mma_O.make_fragment_B(sPt)
 
@@ -651,7 +636,6 @@ class FlashAttentionMLADecodeSm100:
         """Rope-less schedule: S(0); for n: S(n+1) then PV(n); PV(N-1). Block n's four
         latent stages stay pinned until PV(n), so with S(n+1) in flight two blocks are
         resident (the ring holds three)."""
-        h = const_expr(self.h)
         tSrLat = mma_S.make_fragment_A(sLatK)
         tSrQtC = mma_S.make_fragment_B(sQtC)
         tOrLat = mma_O.make_fragment_A(sLatMN)
@@ -667,27 +651,17 @@ class FlashAttentionMLADecodeSm100:
 
         cute.arch.mbarrier_wait(mbar_Q, Int32(0))
 
-        cs_lat, ps_S = self._issue_S_nope(
-            mma_S, sLatK, sQtC, tSrLat, tSrQtC, pl_lat, pl_S, cs_lat, ps_S
-        )
+        s_args = (mma_S, sLatK, sQtC, tSrLat, tSrQtC, pl_lat, pl_S)
+        pv_args = (mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O)
+        cs_lat, ps_S = self._issue_S_nope(*s_args, cs_lat, ps_S)
         if num_n_blocks > Int32(1):
-            cs_lat, ps_S = self._issue_S_nope(
-                mma_S, sLatK, sQtC, tSrLat, tSrQtC, pl_lat, pl_S, cs_lat, ps_S
-            )
-        use_lat, cs_P, ps_O = self._issue_PV_nope(
-            mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O, True
-        )
+            cs_lat, ps_S = self._issue_S_nope(*s_args, cs_lat, ps_S)
+        use_lat, cs_P, ps_O = self._issue_PV_nope(*pv_args, use_lat, cs_P, ps_O, True)
         for _ in cutlass.range(num_n_blocks - 2, unroll=1):
-            cs_lat, ps_S = self._issue_S_nope(
-                mma_S, sLatK, sQtC, tSrLat, tSrQtC, pl_lat, pl_S, cs_lat, ps_S
-            )
-            use_lat, cs_P, ps_O = self._issue_PV_nope(
-                mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O, False
-            )
+            cs_lat, ps_S = self._issue_S_nope(*s_args, cs_lat, ps_S)
+            use_lat, cs_P, ps_O = self._issue_PV_nope(*pv_args, use_lat, cs_P, ps_O, False)
         if num_n_blocks > Int32(1):
-            use_lat, cs_P, ps_O = self._issue_PV_nope(
-                mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O, False
-            )
+            use_lat, cs_P, ps_O = self._issue_PV_nope(*pv_args, use_lat, cs_P, ps_O, False)
 
     @cute.jit
     def _issue_S_nope(self, mma_S, sLatK, sQtC, tSrLat, tSrQtC, pl_lat, pl_S, cs_lat, ps_S):
@@ -758,16 +732,15 @@ class FlashAttentionMLADecodeSm100:
                 zero_init=const_expr(c == 0), cta_group=1,
             )
             cs_lat.advance()
-        if const_expr(self.has_rope):
-            pl_rope.consumer_wait(cs_rope)
-            cute.arch.fence_view_async_shared()
-            fa_sm100_utils.fence_tcgen05_after_thread_sync()
-            fa_sm100_utils.gemm_ptx_partial(
-                mma_S.op, Int32(self.tmem_off_S),
-                tSrRope[None, None, None, cs_rope.index], tSrQtR[None, None, None, 0],
-                sRope[None, None, None, cs_rope.index], sQtR[None, None, None, 0],
-                zero_init=False, cta_group=1,
-            )
+        pl_rope.consumer_wait(cs_rope)
+        cute.arch.fence_view_async_shared()
+        fa_sm100_utils.fence_tcgen05_after_thread_sync()
+        fa_sm100_utils.gemm_ptx_partial(
+            mma_S.op, Int32(self.tmem_off_S),
+            tSrRope[None, None, None, cs_rope.index], tSrQtR[None, None, None, 0],
+            sRope[None, None, None, cs_rope.index], sQtR[None, None, None, 0],
+            zero_init=False, cta_group=1,
+        )
         pl_S.producer_commit(ps_S)
         ps_S.advance()
 
@@ -789,11 +762,9 @@ class FlashAttentionMLADecodeSm100:
         pl_O.producer_commit(ps_O)
         ps_O.advance()
 
-        # rope only: released late because P^T may alias the rope stage, so the next gather
-        # must not overwrite it
-        if const_expr(self.has_rope):
-            pl_rope.consumer_release(cs_rope)
-            cs_rope.advance()
+        # released late: P^T may alias the rope stage, so the next gather must not overwrite it
+        pl_rope.consumer_release(cs_rope)
+        cs_rope.advance()
         pl_P.consumer_release(cs_P)
         cs_P.advance()
         return cs_lat, use_lat, cs_rope, cs_P, ps_S, ps_O
@@ -803,7 +774,7 @@ class FlashAttentionMLADecodeSm100:
     def softmax_loop(
         self, mIndexTopk, mma_S, accS, sRed, sSmMax, sSmSum, sScale, sPt,
         pl_S, pl_P, pl_stats, tidx, warp_idx, m_idx, seqlen_k_limit,
-        softmax_scale_log2, n_block_lo, num_n_blocks, mma_O=None, accS1=None,
+        softmax_scale_log2, n_block_lo, num_n_blocks, accS1=None,
     ):
         h = const_expr(self.h)
         lane_idx = cute.arch.lane_idx()
@@ -858,13 +829,10 @@ class FlashAttentionMLADecodeSm100:
                     seqlen_k_limit, softmax_scale_log2, n_block_lo + i + 1, False,
                 )
         else:
-            # Rope-less: the stats stage is committed as soon as the scale is known
-            # (the correction warps rescale O(n-1) while this block exponentiates),
-            # the row sums stay in registers per warp, and the block needs two named
-            # barriers instead of four. One extra stats stage hands the final sums over.
-            # 16-lane atoms hand each thread two rows (r, r+8) and h/4 heads; the partner
-            # element on the other row sits at i+2 (16x256b, h >= 16) or i+1 (16x128b,
-            # h == 8); lanes agreeing modulo 4 share a head set
+            # Rope-less: the stats stage is committed as soon as the scale is known, the row
+            # sums stay in registers per warp, and one extra stats stage hands the final sums
+            # over. 16-lane atoms give each thread two rows (r, r+8) and h/4 heads; the partner
+            # element sits at i+2 (16x256b, h >= 16) or i+1 (16x128b, h == 8).
             hv = const_expr(cute.size(cS_t2r))
             assert hv % 4 == 0
             pair_step = const_expr(2 if h >= 16 else 1)
