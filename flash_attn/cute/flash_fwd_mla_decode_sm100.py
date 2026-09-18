@@ -1,5 +1,10 @@
 # Copyright (c) 2026, Colfax International.
-"""SM100 sparse-MLA (DSA) decode kernel: the gathered KV tile is the A operand of both MMAs."""
+"""SM100 sparse-MLA (DSA) decode kernel: the gathered KV tile is the A operand of both MMAs.
+
+The rope stream is a compile-time parameter: `hdim_rope=64` is the DeepSeek 64/512 absorbed
+shape, `hdim_rope=0` the rope-less (NoPE) absorbed shape whose query and KV rows are both 512
+wide.  Every rope site is gated on `self.has_rope`; nothing else differs between the two.
+"""
 
 import math
 import operator
@@ -17,17 +22,22 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import CtaGroup, OperandMajorMode
 
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
+from flash_attn.cute.copy_utils import tiled_copy_2d
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
-from flash_attn.cute.utils import get_batch_from_cu_tensor, warp_reduce
+from flash_attn.cute.utils import elem_pointer, get_batch_from_cu_tensor, warp_reduce
 
 
 LOG2_E = math.log2(math.e)
 LN2 = math.log(2.0)
 
-SMEM_CAP_BYTES = 232448  # the measured SM100 dynamic-smem ceiling
+SMEM_CAP_BYTES = 232448
+# rope 0 (tile 64, 16 KiB stages): latent ring depth per per-CTA head count
+_RING_NOPE = {8: 12, 16: 12, 32: 11}  # the measured SM100 dynamic-smem ceiling
 
 # h -> (latent ring depth, P^T aliased onto the rope ring).  n_rope = n_pt = 1 always.
+# The alias applies only when there is a rope ring to alias onto; with hdim_rope == 0 the
+# h == 16 entry falls back to a real sPt allocation (which fits: see __call__'s smem assert).
 _RING = {8: (6, False), 16: (6, True), 32: (5, False)}
 
 
@@ -41,7 +51,9 @@ class FlashAttentionMLADecodeSm100:
         qhead_per_kvhead: int = 16,
         num_splits: int = 1,
         num_head_groups: int = 1,
+        hdim_rope: int = 64,
     ):
+        assert hdim_rope in (0, 64), f"hdim_rope must be 0 (NoPE) or 64, got {hdim_rope}"
         assert num_head_groups >= 1 and qhead_per_kvhead % num_head_groups == 0, (
             f"num_head_groups={num_head_groups} must divide qhead_per_kvhead={qhead_per_kvhead}"
         )
@@ -55,20 +67,28 @@ class FlashAttentionMLADecodeSm100:
         self.h = h_group
         self.num_head_groups = num_head_groups
         self.qhead_per_kvhead = qhead_per_kvhead
-        self.hdim_rope = 64
+        self.hdim_rope = hdim_rope
+        self.has_rope = hdim_rope > 0
         self.hdimv = 512
         self.hdim_total = self.hdimv + self.hdim_rope  # [latent 0..511][rope 512..575]
 
-        self.tile_n = 128
+        # rope 0: 64-row blocks so that two blocks fit the latent ring at once (cross-block
+        # pipelining); the top-k indices are still read in 128-row pairs (gather_tile)
+        self.tile_n = 128 if self.has_rope else 64
+        self.gather_tile = 128
         self.dv_chunk = 128
         self.num_chunks = self.hdimv // self.dv_chunk  # 4
 
         n_blocks_full = topk_length // self.tile_n
-        assert num_splits >= 1 and n_blocks_full % num_splits == 0, (
-            f"num_splits={num_splits} must divide topk_length // tile_n = {n_blocks_full}"
+        assert 1 <= num_splits <= n_blocks_full, (
+            f"num_splits={num_splits} must be in 1..topk_length // tile_n = {n_blocks_full}"
         )
         self.is_split_kv = num_splits > 1
         self.n_blocks_full = n_blocks_full
+        self.num_splits = num_splits
+        # Equal windows when the block count divides; otherwise balanced windows
+        # [s * n // S, (s + 1) * n // S) (e.g. 17 blocks over 8 splits: 2,2,2,2,2,2,2,3).
+        self.even_splits = n_blocks_full % num_splits == 0
         self.blocks_per_split = n_blocks_full // num_splits
         # head group fastest: the G CTAs that gather the SAME top-k rows stay co-resident
         self.num_ctas_per_token = num_head_groups * num_splits
@@ -95,8 +115,11 @@ class FlashAttentionMLADecodeSm100:
         self.dtype_acc = Float32
         # gemm_ptx_partial takes a raw TMEM column index: valid only when the alloc is all of TMEM
         self.tmem_alloc_cols = 512
+        # rope 0: two S accumulators and two P^T stages so S(n+1) is issued before PV(n)
+        self.num_stages_S = 1 if self.has_rope else 2
+        self.num_stages_P = 1 if self.has_rope else 2
         self.tmem_off_S = 0
-        self.tmem_off_O = [self.h * (1 + j) for j in range(self.num_chunks)]
+        self.tmem_off_O = [self.h * (self.num_stages_S + j) for j in range(self.num_chunks)]
         assert self.tmem_off_O[-1] + self.h <= self.tmem_alloc_cols
 
         self.buffer_align_bytes = 1024
@@ -117,19 +140,26 @@ class FlashAttentionMLADecodeSm100:
         # A of S^T (K-major) and A of O^T (MN-major) over the SAME bytes.
         LlatK = sm100_utils.make_smem_layout_a(mma_S, (tn, h, dv), dtype, n_lat)
         LlatMN = sm100_utils.make_smem_layout_a(mma_O, (dv, h, tn), dtype, n_lat)
-        Lrope = sm100_utils.make_smem_layout_a(mma_S, (tn, h, self.hdim_rope), dtype, 1)
-        # B of S^T: four 128-dim Q^T chunks + one 64-dim rope Q^T.
+        Lrope = (
+            sm100_utils.make_smem_layout_a(mma_S, (tn, h, self.hdim_rope), dtype, 1)
+            if const_expr(self.has_rope) else None
+        )
+        # B of S^T: four 128-dim Q^T chunks (+ one 64-dim rope Q^T when there is a rope stream).
         LqtC = sm100_utils.make_smem_layout_b(mma_S, (tn, h, dv), dtype, self.num_chunks)
-        LqtR = sm100_utils.make_smem_layout_b(mma_S, (tn, h, self.hdim_rope), dtype, 1)
+        LqtR = (
+            sm100_utils.make_smem_layout_b(mma_S, (tn, h, self.hdim_rope), dtype, 1)
+            if const_expr(self.has_rope) else None
+        )
         # B of O^T, MN-major (heads contiguous).
-        Lpt = sm100_utils.make_smem_layout_b(mma_O, (dv, h, tn), dtype, 1)
+        Lpt = sm100_utils.make_smem_layout_b(mma_O, (dv, h, tn), dtype, self.num_stages_P)
 
         assert cute.cosize(LlatK) == n_lat * tn * dv
         assert cute.cosize(LlatMN) == n_lat * tn * dv
-        assert cute.cosize(Lrope) == tn * self.hdim_rope
         assert cute.cosize(LqtC) == self.num_chunks * h * dv
-        assert cute.cosize(LqtR) == h * self.hdim_rope
-        assert cute.cosize(Lpt) == tn * h
+        assert cute.cosize(Lpt) == self.num_stages_P * tn * h
+        if const_expr(self.has_rope):
+            assert cute.cosize(Lrope) == tn * self.hdim_rope
+            assert cute.cosize(LqtR) == h * self.hdim_rope
         return mma_S, mma_O, LlatK, LlatMN, Lrope, LqtC, LqtR, Lpt
 
     def _get_shared_storage_cls(self, dtype, n_lat, alias_pt_on_rope):
@@ -142,15 +172,15 @@ class FlashAttentionMLADecodeSm100:
         lat_elems = n_lat * tn * self.dv_chunk
         rope_elems = tn * self.hdim_rope
         qt_elems = h * self.hdim_total
-        pt_elems = 0 if alias_pt_on_rope else tn * h
+        pt_elems = 0 if alias_pt_on_rope else self.num_stages_P * tn * h
 
         # 128B-align the fp32 arrays so racecheck does not report hazards across their boundary
         @cute.struct
         class SharedStorage:
             mbar_lat: cute.struct.MemRange[Int64, 2 * n_lat]
             mbar_rope: cute.struct.MemRange[Int64, 2]
-            mbar_S: cute.struct.MemRange[Int64, 2]
-            mbar_P: cute.struct.MemRange[Int64, 2]
+            mbar_S: cute.struct.MemRange[Int64, 2 * self.num_stages_S]
+            mbar_P: cute.struct.MemRange[Int64, 2 * self.num_stages_P]
             mbar_O: cute.struct.MemRange[Int64, 2]
             mbar_stats: cute.struct.MemRange[Int64, 2 * nst]
             mbar_Q: cute.struct.MemRange[Int64, 1]
@@ -171,9 +201,9 @@ class FlashAttentionMLADecodeSm100:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,              # (total_q, h, 64)
+        mQ: Optional[cute.Tensor],    # (total_q, h, 64), None when hdim_rope == 0
         mQv: cute.Tensor,             # (total_q, h, 512)
-        mK: cute.Tensor,              # (total_k, h_k, 64)
+        mK: Optional[cute.Tensor],    # (total_k, h_k, 64), None when hdim_rope == 0
         mV: cute.Tensor,              # (total_k, h_k, 512)
         mO: cute.Tensor,              # (total_q, h, 512)  or (S, total_q, h, 512) fp32
         mLSE: Optional[cute.Tensor],  # (S, h, total_q) split, (total_q, h) unsplit, None if unused
@@ -192,6 +222,10 @@ class FlashAttentionMLADecodeSm100:
         dtype = mV.element_type
         assert dtype in (cutlass.Float16, cutlass.BFloat16), "sparse decode requires 16-bit KV"
         self.dtype_O = mO.element_type
+        if const_expr(self.has_rope):
+            assert mQ is not None and mK is not None, "hdim_rope=64 needs the rope Q and K"
+        else:
+            assert mQ is None and mK is None, "hdim_rope=0 (NoPE) takes no rope Q or K"
 
         new_stride = lambda mX: (
             *(cute.assume(s, divby=128 // mX.element_type.width) for s in mX.stride[:-1]),
@@ -199,11 +233,13 @@ class FlashAttentionMLADecodeSm100:
         )
         mQ, mQv, mK, mV, mO = [
             cute.make_tensor(mX.iterator, cute.make_layout(mX.shape, stride=new_stride(mX)))
+            if mX is not None else None
             for mX in (mQ, mQv, mK, mV, mO)
         ]
         # (total, h, d) -> (total, d, h)
         mQ, mQv = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=[0, 2, 1]))
+            if mX is not None else None
             for mX in (mQ, mQv)
         ]
         if const_expr(self.is_split_kv):
@@ -215,6 +251,7 @@ class FlashAttentionMLADecodeSm100:
             mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=[0, 2, 1]))
         mK, mV = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=[0, 2, 1]))
+            if mX is not None else None
             for mX in (mK, mV)
         ]
         # (total_q, topk) -> (topk, total_q)
@@ -223,6 +260,13 @@ class FlashAttentionMLADecodeSm100:
         )
 
         n_lat, alias_pt = _RING[self.h]
+        if const_expr(not self.has_rope):
+            n_lat = _RING_NOPE[self.h]  # 16 KiB stages: three 64-row blocks resident
+            # the MMA warp issues S(n+1) while block n's four stages are still pinned by
+            # PV(n): fewer than two resident blocks deadlocks the schedule
+            assert n_lat >= 2 * self.num_chunks
+        # no rope ring to alias onto: h == 16 gets a real sPt (the smem assert below is the proof)
+        alias_pt = alias_pt and self.has_rope
         SharedStorage = self._get_shared_storage_cls(dtype, n_lat, alias_pt)
         smem_bytes = SharedStorage.size_in_bytes()
         assert smem_bytes <= SMEM_CAP_BYTES, (
@@ -255,9 +299,9 @@ class FlashAttentionMLADecodeSm100:
     @cute.kernel
     def kernel(
         self,
-        mQ: cute.Tensor,
+        mQ: Optional[cute.Tensor],
         mQv: cute.Tensor,
-        mK: cute.Tensor,
+        mK: Optional[cute.Tensor],
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
@@ -270,9 +314,9 @@ class FlashAttentionMLADecodeSm100:
         mma_O: cute.TiledMma,
         LlatK: cute.ComposedLayout,
         LlatMN: cute.ComposedLayout,
-        Lrope: cute.ComposedLayout,
+        Lrope: Optional[cute.ComposedLayout],
         LqtC: cute.ComposedLayout,
-        LqtR: cute.ComposedLayout,
+        LqtR: Optional[cute.ComposedLayout],
         Lpt: cute.ComposedLayout,
         softmax_scale_log2: Float32,
         SharedStorage: cutlass.Constexpr[Callable],
@@ -289,7 +333,15 @@ class FlashAttentionMLADecodeSm100:
         hg_idx = rem % self.num_head_groups
         split_idx = rem // self.num_head_groups
 
-        batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
+        if const_expr(self.has_rope):
+            batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
+        else:
+            # Decode batches carry one token per request (cu_seqlens_q == arange), so
+            # two independent loads settle the batch; the binary search's dependent
+            # loads are only taken when a request has several query tokens.
+            batch_idx = m_idx
+            if mCuSeqlensQ[m_idx] != m_idx or mCuSeqlensQ[m_idx + 1] != m_idx + 1:
+                batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
         seqlen = SeqlenInfoQK.create(
             batch_idx, Int32(1), Int32(1),
             mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,
@@ -311,28 +363,38 @@ class FlashAttentionMLADecodeSm100:
         if const_expr(not self.is_split_kv):
             n_block_lo = Int32(0)
             num_n_blocks = n_valid_blocks
-        else:
+        elif const_expr(self.even_splits):
             # a split entirely past the valid window still walks one all-masked block
             n_block_lo = split_idx * Int32(self.blocks_per_split)
             num_n_blocks = max(
                 Int32(1),
                 min(n_valid_blocks, n_block_lo + Int32(self.blocks_per_split)) - n_block_lo,
             )
+        else:
+            n_block_lo = (split_idx * Int32(self.n_blocks_full)) // Int32(self.num_splits)
+            n_block_hi = ((split_idx + 1) * Int32(self.n_blocks_full)) // Int32(self.num_splits)
+            num_n_blocks = max(Int32(1), min(n_valid_blocks, n_block_hi) - n_block_lo)
 
         # ==== smem ==================================================================
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         lat_ptr = storage.sLat.data_ptr()
-        rope_ptr = storage.sRope.data_ptr()
+        rope_ptr = storage.sRope.data_ptr()  # zero-length MemRange when hdim_rope == 0
         sLatK = cute.make_tensor(cute.recast_ptr(lat_ptr, LlatK.inner, dtype), LlatK.outer)
         sLatMN = cute.make_tensor(cute.recast_ptr(lat_ptr, LlatMN.inner, dtype), LlatMN.outer)
-        sRope = cute.make_tensor(cute.recast_ptr(rope_ptr, Lrope.inner, dtype), Lrope.outer)
+        sRope = (
+            cute.make_tensor(cute.recast_ptr(rope_ptr, Lrope.inner, dtype), Lrope.outer)
+            if const_expr(self.has_rope) else None
+        )
         qt_ptr = storage.sQt.data_ptr()
         sQtC = cute.make_tensor(cute.recast_ptr(qt_ptr, LqtC.inner, dtype), LqtC.outer)
-        sQtR = cute.make_tensor(
-            cute.recast_ptr(qt_ptr + self.num_chunks * h * self.dv_chunk, LqtR.inner, dtype),
-            LqtR.outer,
+        sQtR = (
+            cute.make_tensor(
+                cute.recast_ptr(qt_ptr + self.num_chunks * h * self.dv_chunk, LqtR.inner, dtype),
+                LqtR.outer,
+            )
+            if const_expr(self.has_rope) else None
         )
         if const_expr(self.alias_pt_on_rope):
             # sound because pl_rope's consumer release is delayed until after the O^T MMAs
@@ -360,22 +422,25 @@ class FlashAttentionMLADecodeSm100:
             producer_group=gather_grp, consumer_group=mma_grp,
             cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
         )
-        pl_rope = pipeline.PipelineAsyncUmma.create(
-            barrier_storage=storage.mbar_rope.data_ptr(), num_stages=1,
-            producer_group=gather_grp, consumer_group=mma_grp,
-            cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
-        )
+        if const_expr(self.has_rope):
+            pl_rope = pipeline.PipelineAsyncUmma.create(
+                barrier_storage=storage.mbar_rope.data_ptr(), num_stages=1,
+                producer_group=gather_grp, consumer_group=mma_grp,
+                cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
+            )
+            assert pl_rope.sync_object_full.arrive_count == self.num_gather_threads
+        else:
+            pl_rope = None
         # arrive.noinc does not bump the pending count: arrive count must equal the gather threads
         assert pl_lat.sync_object_full.arrive_count == self.num_gather_threads
-        assert pl_rope.sync_object_full.arrive_count == self.num_gather_threads
 
         pl_S = pipeline.PipelineUmmaAsync.create(
-            barrier_storage=storage.mbar_S.data_ptr(), num_stages=1,
+            barrier_storage=storage.mbar_S.data_ptr(), num_stages=self.num_stages_S,
             producer_group=mma_grp, consumer_group=sm_grp,
             cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
         )
         pl_P = pipeline.PipelineAsyncUmma.create(
-            barrier_storage=storage.mbar_P.data_ptr(), num_stages=1,
+            barrier_storage=storage.mbar_P.data_ptr(), num_stages=self.num_stages_P,
             producer_group=sm_grp, consumer_group=mma_grp,
             cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
         )
@@ -416,6 +481,11 @@ class FlashAttentionMLADecodeSm100:
         accO_fake = thr_mma_O.make_fragment_C(thr_mma_O.partition_shape_C((self.dv_chunk, h)))
 
         accS = cute.make_tensor(tmem_ptr + self.tmem_off_S, accS_fake.layout)[(None, None), 0, 0]
+        if const_expr(not self.has_rope):
+            # second S stage (M=64 Layout F: rows in lanes 32*(r//16) + r%16), h columns on
+            accS1 = cute.make_tensor(
+                tmem_ptr + self.tmem_off_S + h, accS_fake.layout
+            )[(None, None), 0, 0]
         accO = [
             cute.make_tensor(tmem_ptr + self.tmem_off_O[j], accO_fake.layout)[(None, None), 0, 0]
             for j in range(self.num_chunks)
@@ -426,7 +496,8 @@ class FlashAttentionMLADecodeSm100:
             self.softmax_loop(
                 mIndexTopk, mma_S, accS, sRed, sSmMax, sSmSum, sScale, sPt,
                 pl_S, pl_P, pl_stats, tidx, warp_idx, m_idx, seqlen_k_limit,
-                softmax_scale_log2, n_block_lo, num_n_blocks,
+                softmax_scale_log2, n_block_lo, num_n_blocks, mma_O,
+                accS1 if const_expr(not self.has_rope) else None,
             )
         elif warp_idx < self.mma_warp_id:
             self.corr_epilogue_loop(
@@ -436,10 +507,16 @@ class FlashAttentionMLADecodeSm100:
                 softmax_scale_log2, num_n_blocks,
             )
         elif warp_idx == self.mma_warp_id:
-            self.mma_loop(
-                mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
-                pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
-            )
+            if const_expr(self.has_rope):
+                self.mma_loop(
+                    mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
+                    pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
+                )
+            else:
+                self._mma_loop_nope(
+                    mma_S, mma_O, sLatK, sLatMN, sQtC, sPt,
+                    pl_lat, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
+                )
         elif warp_idx >= self.gather_warp_lo:
             self.gather_loop(
                 mIndexTopk, mK, mV, sLatK, sRope, pl_lat, pl_rope,
@@ -466,40 +543,66 @@ class FlashAttentionMLADecodeSm100:
             warp_idx - self.gather_warp_lo,
             self.topk_length,
             seqlen_k_limit,
-            self.tile_n,
+            self.gather_tile,
             self.hdim_rope,
             self.hdimv,
             self.num_chunks,  # num_hdimv_splits: one hdim_v split per latent chunk
             self.num_gather_threads,
             dtype,
             1,  # cta_group_size
+            direct_rows=0 if self.has_rope else self.tile_n,
             disable_bitmask=False,
         )
         mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=2)[None, None, head_kv]
-        mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=2)[None, None, head_kv]
+        mK_cur = (
+            seqlen.offset_batch_K(mK, batch_idx, dim=2)[None, None, head_kv]
+            if const_expr(self.has_rope) else None
+        )
 
         ps_lat = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.n_lat)
         ps_rope = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
 
-        for n_block in cutlass.range(num_n_blocks, unroll=1):
-            mgr.load_index_topk(n_block_lo + n_block, transpose=False)
-            for c in cutlass.range_constexpr(self.num_chunks):
-                pl_lat.producer_acquire(ps_lat)
-                mgr.load_X(
-                    mV_cur, sLatK[None, None, None, ps_lat.index], False, "V", c * self.dv_chunk
-                )
+        if const_expr(self.has_rope):
+            for n_block in cutlass.range(num_n_blocks, unroll=1):
+                mgr.load_index_topk(n_block_lo + n_block, transpose=False)
+                for c in cutlass.range_constexpr(self.num_chunks):
+                    pl_lat.producer_acquire(ps_lat)
+                    mgr.load_X(
+                        mV_cur, sLatK[None, None, None, ps_lat.index], False, "V", c * self.dv_chunk
+                    )
+                    cute.arch.cp_async_commit_group()
+                    pl_lat.sync_object_full.arrive_cp_async_mbarrier(ps_lat.index)
+                    ps_lat.advance()
+                pl_rope.producer_acquire(ps_rope)
+                mgr.load_X(mK_cur, sRope[None, None, None, ps_rope.index], False, "K", 0)
                 cute.arch.cp_async_commit_group()
-                pl_lat.sync_object_full.arrive_cp_async_mbarrier(ps_lat.index)
-                ps_lat.advance()
-            pl_rope.producer_acquire(ps_rope)
-            mgr.load_X(mK_cur, sRope[None, None, None, ps_rope.index], False, "K", 0)
-            cute.arch.cp_async_commit_group()
-            pl_rope.sync_object_full.arrive_cp_async_mbarrier(ps_rope.index)
-            ps_rope.advance()
+                pl_rope.sync_object_full.arrive_cp_async_mbarrier(ps_rope.index)
+                ps_rope.advance()
+        else:
+            # 64-row blocks: each gather thread reads the four indices of the rows it copies
+            # and builds their pointers once per block, so the four chunk copies need no
+            # per-row index shuffles (the pointer and the validity flag stay in registers)
+            n_block_last = n_block_lo + num_n_blocks - 1
+            mgr.prefetch_row_index(n_block_lo * Int32(self.tile_n))
+            for n_block in cutlass.range(num_n_blocks, unroll=1):
+                mgr.commit_row_ptrs(mV_cur)
+                # next block's indices are issued now and consumed after these four copies
+                blk_next = cutlass.min(n_block_lo + n_block + 1, n_block_last)
+                mgr.prefetch_row_index(blk_next * Int32(self.tile_n))
+                for c in cutlass.range_constexpr(self.num_chunks):
+                    pl_lat.producer_acquire(ps_lat)
+                    mgr.load_X(
+                        mV_cur, sLatK[None, None, None, ps_lat.index], False, "V",
+                        c * self.dv_chunk, rows=self.tile_n, direct=True,
+                    )
+                    cute.arch.cp_async_commit_group()
+                    pl_lat.sync_object_full.arrive_cp_async_mbarrier(ps_lat.index)
+                    ps_lat.advance()
 
         # every empty-barrier arrive (a tcgen05 commit from the MMA warp) must have landed
         pl_lat.producer_tail(ps_lat)
-        pl_rope.producer_tail(ps_rope)
+        if const_expr(self.has_rope):
+            pl_rope.producer_tail(ps_rope)
 
     # ================================================================== MMA warp
     @cute.jit
@@ -508,9 +611,9 @@ class FlashAttentionMLADecodeSm100:
         pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
     ):
         tSrLat = mma_S.make_fragment_A(sLatK)
-        tSrRope = mma_S.make_fragment_A(sRope)
+        tSrRope = mma_S.make_fragment_A(sRope) if const_expr(self.has_rope) else None
         tSrQtC = mma_S.make_fragment_B(sQtC)
-        tSrQtR = mma_S.make_fragment_B(sQtR)
+        tSrQtR = mma_S.make_fragment_B(sQtR) if const_expr(self.has_rope) else None
         tOrLat = mma_O.make_fragment_A(sLatMN)
         tOrPt = mma_O.make_fragment_B(sPt)
 
@@ -541,6 +644,96 @@ class FlashAttentionMLADecodeSm100:
             )
 
     @cute.jit
+    def _mma_loop_nope(
+        self, mma_S, mma_O, sLatK, sLatMN, sQtC, sPt,
+        pl_lat, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
+    ):
+        """Rope-less schedule: S(0); for n: S(n+1) then PV(n); PV(N-1). Block n's four
+        latent stages stay pinned until PV(n), so with S(n+1) in flight two blocks are
+        resident (the ring holds three)."""
+        h = const_expr(self.h)
+        tSrLat = mma_S.make_fragment_A(sLatK)
+        tSrQtC = mma_S.make_fragment_B(sQtC)
+        tOrLat = mma_O.make_fragment_A(sLatMN)
+        tOrPt = mma_O.make_fragment_B(sPt)
+
+        Producer = pipeline.PipelineUserType.Producer
+        Consumer = pipeline.PipelineUserType.Consumer
+        cs_lat = pipeline.make_pipeline_state(Consumer, self.n_lat)   # S^T reads
+        use_lat = pipeline.make_pipeline_state(Consumer, self.n_lat)  # O^T reads
+        cs_P = pipeline.make_pipeline_state(Consumer, self.num_stages_P)
+        ps_S = pipeline.make_pipeline_state(Producer, self.num_stages_S)
+        ps_O = pipeline.make_pipeline_state(Producer, 1)
+
+        cute.arch.mbarrier_wait(mbar_Q, Int32(0))
+
+        cs_lat, ps_S = self._issue_S_nope(
+            mma_S, sLatK, sQtC, tSrLat, tSrQtC, pl_lat, pl_S, cs_lat, ps_S
+        )
+        if num_n_blocks > Int32(1):
+            cs_lat, ps_S = self._issue_S_nope(
+                mma_S, sLatK, sQtC, tSrLat, tSrQtC, pl_lat, pl_S, cs_lat, ps_S
+            )
+        use_lat, cs_P, ps_O = self._issue_PV_nope(
+            mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O, True
+        )
+        for _ in cutlass.range(num_n_blocks - 2, unroll=1):
+            cs_lat, ps_S = self._issue_S_nope(
+                mma_S, sLatK, sQtC, tSrLat, tSrQtC, pl_lat, pl_S, cs_lat, ps_S
+            )
+            use_lat, cs_P, ps_O = self._issue_PV_nope(
+                mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O, False
+            )
+        if num_n_blocks > Int32(1):
+            use_lat, cs_P, ps_O = self._issue_PV_nope(
+                mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O, False
+            )
+
+    @cute.jit
+    def _issue_S_nope(self, mma_S, sLatK, sQtC, tSrLat, tSrQtC, pl_lat, pl_S, cs_lat, ps_S):
+        h = const_expr(self.h)
+        pl_S.producer_acquire(ps_S)
+        for c in cutlass.range_constexpr(self.num_chunks):
+            pl_lat.consumer_wait(cs_lat)
+            cute.arch.fence_view_async_shared()
+            fa_sm100_utils.fence_tcgen05_after_thread_sync()
+            st = cs_lat.index
+            fa_sm100_utils.gemm_ptx_partial(
+                mma_S.op, Int32(self.tmem_off_S) + ps_S.index * Int32(h),
+                tSrLat[None, None, None, st], tSrQtC[None, None, None, c],
+                sLatK[None, None, None, st], sQtC[None, None, None, c],
+                zero_init=const_expr(c == 0), cta_group=1,
+            )
+            cs_lat.advance()
+        pl_S.producer_commit(ps_S)
+        ps_S.advance()
+        return cs_lat, ps_S
+
+    @cute.jit
+    def _issue_PV_nope(
+        self, mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O,
+        is_first: cutlass.Constexpr[bool],
+    ):
+        pl_P.consumer_wait(cs_P)
+        pl_O.producer_acquire(ps_O)
+        fa_sm100_utils.fence_tcgen05_after_thread_sync()
+        for c in cutlass.range_constexpr(self.num_chunks):
+            st = use_lat.index
+            fa_sm100_utils.gemm_ptx_partial(
+                mma_O.op, Int32(self.tmem_off_O[c]),
+                tOrLat[None, None, None, st], tOrPt[None, None, None, cs_P.index],
+                sLatMN[None, None, None, st], sPt[None, None, None, cs_P.index],
+                zero_init=const_expr(is_first), cta_group=1,
+            )
+            pl_lat.consumer_release(use_lat)
+            use_lat.advance()
+        pl_O.producer_commit(ps_O)
+        ps_O.advance()
+        pl_P.consumer_release(cs_P)
+        cs_P.advance()
+        return use_lat, cs_P, ps_O
+
+    @cute.jit
     def _mma_block(
         self, mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
         tSrLat, tSrRope, tSrQtC, tSrQtR, tOrLat, tOrPt,
@@ -565,15 +758,16 @@ class FlashAttentionMLADecodeSm100:
                 zero_init=const_expr(c == 0), cta_group=1,
             )
             cs_lat.advance()
-        pl_rope.consumer_wait(cs_rope)
-        cute.arch.fence_view_async_shared()
-        fa_sm100_utils.fence_tcgen05_after_thread_sync()
-        fa_sm100_utils.gemm_ptx_partial(
-            mma_S.op, Int32(self.tmem_off_S),
-            tSrRope[None, None, None, cs_rope.index], tSrQtR[None, None, None, 0],
-            sRope[None, None, None, cs_rope.index], sQtR[None, None, None, 0],
-            zero_init=False, cta_group=1,
-        )
+        if const_expr(self.has_rope):
+            pl_rope.consumer_wait(cs_rope)
+            cute.arch.fence_view_async_shared()
+            fa_sm100_utils.fence_tcgen05_after_thread_sync()
+            fa_sm100_utils.gemm_ptx_partial(
+                mma_S.op, Int32(self.tmem_off_S),
+                tSrRope[None, None, None, cs_rope.index], tSrQtR[None, None, None, 0],
+                sRope[None, None, None, cs_rope.index], sQtR[None, None, None, 0],
+                zero_init=False, cta_group=1,
+            )
         pl_S.producer_commit(ps_S)
         ps_S.advance()
 
@@ -595,9 +789,11 @@ class FlashAttentionMLADecodeSm100:
         pl_O.producer_commit(ps_O)
         ps_O.advance()
 
-        # released late: P^T may alias the rope stage, so the next gather must not overwrite it
-        pl_rope.consumer_release(cs_rope)
-        cs_rope.advance()
+        # rope only: released late because P^T may alias the rope stage, so the next gather
+        # must not overwrite it
+        if const_expr(self.has_rope):
+            pl_rope.consumer_release(cs_rope)
+            cs_rope.advance()
         pl_P.consumer_release(cs_P)
         cs_P.advance()
         return cs_lat, use_lat, cs_rope, cs_P, ps_S, ps_O
@@ -607,21 +803,33 @@ class FlashAttentionMLADecodeSm100:
     def softmax_loop(
         self, mIndexTopk, mma_S, accS, sRed, sSmMax, sSmSum, sScale, sPt,
         pl_S, pl_P, pl_stats, tidx, warp_idx, m_idx, seqlen_k_limit,
-        softmax_scale_log2, n_block_lo, num_n_blocks,
+        softmax_scale_log2, n_block_lo, num_n_blocks, mma_O=None, accS1=None,
     ):
         h = const_expr(self.h)
         lane_idx = cute.arch.lane_idx()
         mIndexTopk_cur = mIndexTopk[None, m_idx]
 
         thr_mma_S = mma_S.get_slice(0)
-        ld_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(h)), Float32
-        )
+        if const_expr(self.has_rope):
+            ld_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(h)), Float32
+            )
+        elif const_expr(h >= 16):
+            # 64-row Layout-F accumulator: 16 lanes x 256 bits per atom, so every lane of
+            # a softmax warp owns one row and h/2 heads (lanes 0-15 the first half)
+            ld_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(h // 16)), Float32
+            )
+        else:
+            ld_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x128bOp(tcgen05.copy.Repetition(1)), Float32
+            )
         thr_ldS = tcgen05.make_tmem_copy(ld_atom, accS).get_slice(tidx)
         cS = cute.make_identity_tensor((self.tile_n, h))
         cS_t2r = thr_ldS.partition_D(thr_mma_S.partition_C(cS)[(None, None), 0, 0])
-        assert cute.size(cS_t2r) == h
+        assert cute.size(cS_t2r) == (h if const_expr(self.has_rope) else h // 2)
         tSaccS = thr_ldS.partition_S(accS)
+        tSaccS1 = thr_ldS.partition_S(accS1) if const_expr(accS1 is not None) else None
         tSrS = cute.make_rmem_tensor(cS_t2r.shape, Float32)
         tSrP = cute.make_rmem_tensor(cS_t2r.shape, Float32)
         key_row = cS_t2r[0][0]
@@ -629,25 +837,66 @@ class FlashAttentionMLADecodeSm100:
         pt_layout = cute.make_ordered_layout((h, self.tile_n), order=(0, 1))
 
         states = (
-            pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1),
-            pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1),
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_stages_S),
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_stages_P),
             pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages_stats
             ),
         )
-        states = self._softmax_block(
-            mIndexTopk_cur, sRed, sSmMax, sSmSum, sScale, sPt, pt_layout,
-            thr_ldS, tSaccS, tSrS, tSrP, cS_t2r, key_row,
-            pl_S, pl_P, pl_stats, states, tidx, warp_idx, lane_idx,
-            seqlen_k_limit, softmax_scale_log2, n_block_lo, True,
-        )
-        for i in cutlass.range(num_n_blocks - 1, unroll=1):
+        if const_expr(self.has_rope):
             states = self._softmax_block(
                 mIndexTopk_cur, sRed, sSmMax, sSmSum, sScale, sPt, pt_layout,
                 thr_ldS, tSaccS, tSrS, tSrP, cS_t2r, key_row,
                 pl_S, pl_P, pl_stats, states, tidx, warp_idx, lane_idx,
-                seqlen_k_limit, softmax_scale_log2, n_block_lo + i + 1, False,
+                seqlen_k_limit, softmax_scale_log2, n_block_lo, True,
             )
+            for i in cutlass.range(num_n_blocks - 1, unroll=1):
+                states = self._softmax_block(
+                    mIndexTopk_cur, sRed, sSmMax, sSmSum, sScale, sPt, pt_layout,
+                    thr_ldS, tSaccS, tSrS, tSrP, cS_t2r, key_row,
+                    pl_S, pl_P, pl_stats, states, tidx, warp_idx, lane_idx,
+                    seqlen_k_limit, softmax_scale_log2, n_block_lo + i + 1, False,
+                )
+        else:
+            # Rope-less: the stats stage is committed as soon as the scale is known
+            # (the correction warps rescale O(n-1) while this block exponentiates),
+            # the row sums stay in registers per warp, and the block needs two named
+            # barriers instead of four. One extra stats stage hands the final sums over.
+            # 16-lane atoms hand each thread two rows (r, r+8) and h/4 heads; the partner
+            # element on the other row sits at i+2 (16x256b, h >= 16) or i+1 (16x128b,
+            # h == 8); lanes agreeing modulo 4 share a head set
+            hv = const_expr(cute.size(cS_t2r))
+            assert hv % 4 == 0
+            pair_step = const_expr(2 if h >= 16 else 1)
+            tSrRs = cute.make_rmem_tensor(cS_t2r.shape, Float32)
+            for i in cutlass.range_constexpr(hv):
+                tSrRs[i] = Float32(0.0)
+            bar_sm = pipeline.NamedBarrier(
+                barrier_id=self.bar_id_softmax, num_threads=self.num_softmax_threads
+            )
+            for i in cutlass.range(num_n_blocks, unroll=1):
+                states = self._softmax_block_nope(
+                    mIndexTopk_cur, sRed, sSmMax, sScale, sPt, pt_layout,
+                    thr_ldS, tSaccS, tSaccS1, tSrS, tSrP, tSrRs, cS_t2r, pair_step,
+                    bar_sm, pl_S, pl_P, pl_stats, states, tidx, warp_idx, lane_idx,
+                    seqlen_k_limit, softmax_scale_log2, n_block_lo + i,
+                )
+            cs_S, ps_P, ps_st = states
+            # final row sums: lanes 0..3 hold the four head sets of their warp
+            if lane_idx < Int32(4):
+                for i in cutlass.range_constexpr(hv):
+                    if const_expr((i // pair_step) % 2 == 0):
+                        sRed[warp_idx, cS_t2r[i][1]] = tSrRs[i]
+            bar_sm.arrive_and_wait()
+            pl_stats.producer_acquire(ps_st)
+            if tidx < h:
+                rs = sRed[0, tidx]
+                for w in cutlass.range_constexpr(1, self.num_softmax_warps):
+                    rs = rs + sRed[w, tidx]
+                sSmSum[tidx] = rs
+            pl_stats.producer_commit(ps_st)
+            ps_st.advance()
+            states = cs_S, ps_P, ps_st
         _, ps_P, ps_st = states
         pl_P.producer_tail(ps_P)
         pl_stats.producer_tail(ps_st)
@@ -749,6 +998,100 @@ class FlashAttentionMLADecodeSm100:
         ps_st.advance()
         return cs_S, ps_P, ps_st
 
+    @cute.jit
+    def _softmax_block_nope(
+        self, mIndexTopk_cur, sRed, sSmMax, sScale, sPt, pt_layout,
+        thr_ldS, tSaccS, tSaccS1, tSrS, tSrP, tSrRs, cS_t2r, pair_step, bar_sm,
+        pl_S, pl_P, pl_stats, states, tidx, warp_idx, lane_idx,
+        seqlen_k_limit, softmax_scale_log2, n_block: Int32,
+    ):
+        h = const_expr(self.h)
+        hv = const_expr(cute.size(cS_t2r))
+        ps = const_expr(pair_step)
+        cs_S, ps_P, ps_st = states
+
+        # this thread's two rows: element i sits on row r when (i // ps) is even, r+8 otherwise
+        topk_idx0 = mIndexTopk_cur[n_block * self.tile_n + cS_t2r[0][0]]
+        topk_idx1 = mIndexTopk_cur[n_block * self.tile_n + cS_t2r[ps][0]]
+        key_valid0 = topk_idx0 >= 0 and topk_idx0 < seqlen_k_limit
+        key_valid1 = topk_idx1 >= 0 and topk_idx1 < seqlen_k_limit
+
+        # ---- read S^T (this block's accumulator stage) and release it ------------
+        pl_S.consumer_wait(cs_S)
+        fa_sm100_utils.fence_tcgen05_after_thread_sync()
+        if cs_S.index == Int32(0):
+            cute.copy(thr_ldS, tSaccS, tSrS)
+        else:
+            cute.copy(thr_ldS, tSaccS1, tSrS)
+        cute.arch.fence_view_async_tmem_load()
+        fa_sm100_utils.fence_tcgen05_before_thread_sync()
+        pl_S.consumer_release(cs_S)
+        cs_S.advance()
+
+        for i in cutlass.range_constexpr(hv):
+            if const_expr((i // ps) % 2 == 0):
+                tSrS[i] = tSrS[i] if key_valid0 else -Float32.inf
+            else:
+                tSrS[i] = tSrS[i] if key_valid1 else -Float32.inf
+
+        # ---- block max per head over the warp's 16 rows: fold the row pair in the
+        # thread, then butterfly over the lanes that share this head set (xor 4, 8, 16)
+        for i in cutlass.range_constexpr(hv):
+            if const_expr((i // ps) % 2 == 0):
+                m = cute.arch.fmax(tSrS[i], tSrS[i + ps])
+                for off in cutlass.range_constexpr(2, 5):
+                    m = cute.arch.fmax(m, cute.arch.shuffle_sync_bfly(m, offset=1 << off))
+                tSrP[i] = m
+        if lane_idx < Int32(4):
+            for i in cutlass.range_constexpr(hv):
+                if const_expr((i // ps) % 2 == 0):
+                    sRed[warp_idx, cS_t2r[i][1]] = tSrP[i]
+        bar_sm.arrive_and_wait()
+
+        # ---- running max and the rescale factor; block 0 initializes (scale 0) ----
+        pl_stats.producer_acquire(ps_st)
+        st_idx = ps_st.index
+        if tidx < h:
+            m_blk = sRed[0, tidx]
+            for w in cutlass.range_constexpr(1, self.num_softmax_warps):
+                m_blk = cute.arch.fmax(m_blk, sRed[w, tidx])
+            m_old = sSmMax[tidx] if n_block > Int32(0) else -Float32.inf
+            m_new = cute.arch.fmax(m_old, m_blk)
+            sSmMax[tidx] = m_new
+            sScale[st_idx, tidx] = (
+                cute.math.exp2((m_old - m_new) * softmax_scale_log2, fastmath=True)
+                if m_old != -Float32.inf else Float32(0.0)
+            )
+        bar_sm.arrive_and_wait()
+        # the correction warps only need the scale: hand it over before the exponentials
+        pl_stats.producer_commit(ps_st)
+        ps_st.advance()
+
+        # ---- P = exp2(S * scale_log2 - m_new * scale_log2) ------------------------
+        for i in cutlass.range_constexpr(hv):
+            row_max = sSmMax[cS_t2r[i][1]]
+            safe_max = row_max if row_max != -Float32.inf else Float32(0.0)
+            bias = -safe_max * softmax_scale_log2
+            tSrP[i] = cute.math.exp2(tSrS[i] * softmax_scale_log2 + bias, fastmath=True)
+
+        # ---- running row sums per head set, rescaled like the accumulator ---------
+        for i in cutlass.range_constexpr(hv):
+            if const_expr((i // ps) % 2 == 0):
+                blk_sum = tSrP[i] + tSrP[i + ps]
+                for off in cutlass.range_constexpr(2, 5):
+                    blk_sum = blk_sum + cute.arch.shuffle_sync_bfly(blk_sum, offset=1 << off)
+                tSrRs[i] = tSrRs[i] * sScale[st_idx, cS_t2r[i][1]] + blk_sum
+
+        # ---- P^T staging: this thread's two rows, its heads, MN-major -------------
+        pl_P.producer_acquire(ps_P)
+        pt_nd = cute.composition(sPt[None, None, None, ps_P.index], pt_layout)
+        for i in cutlass.range_constexpr(hv):
+            pt_nd[cS_t2r[i][1], cS_t2r[i][0]] = tSrP[i].to(sPt.element_type)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        pl_P.producer_commit(ps_P)
+        ps_P.advance()
+        return cs_S, ps_P, ps_st
+
     # =========================================== correction + Q^T load + epilogue
     @cute.jit
     def corr_epilogue_loop(
@@ -765,19 +1108,35 @@ class FlashAttentionMLADecodeSm100:
             barrier_id=self.bar_id_corr, num_threads=self.num_corr_threads
         )
 
-        # ---- Q^T load: (h, 576) K-major, four 128-dim chunks + the rope chunk -----
+        # ---- Q^T load: (h, 512 + hdim_rope) K-major, four 128-dim chunks + the rope chunk --
         qtc_layout = cute.make_ordered_layout((h, self.dv_chunk), order=(0, 1))
-        qtr_layout = cute.make_ordered_layout((h, self.hdim_rope), order=(0, 1))
+        qtr_layout = (
+            cute.make_ordered_layout((h, self.hdim_rope), order=(0, 1))
+            if const_expr(self.has_rope) else None
+        )
         gQv = mQv[m_idx, None, None]  # (512, h_total)
-        gQr = mQ[m_idx, None, None]  # (64,  h_total)
-        for c in cutlass.range_constexpr(self.num_chunks):
-            qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
-            for n in cutlass.range_constexpr(h):
-                qt_nd[n, ctid] = gQv[c * self.dv_chunk + ctid, head_base + n]
-        qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
-        if ctid < self.hdim_rope:
-            for n in cutlass.range_constexpr(h):
-                qt_rope[n, ctid] = gQr[ctid, head_base + n]
+        gQr = mQ[m_idx, None, None] if const_expr(self.has_rope) else None  # (64, h_total)
+        if const_expr(self.has_rope):
+            for c in cutlass.range_constexpr(self.num_chunks):
+                qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
+                for n in cutlass.range_constexpr(h):
+                    qt_nd[n, ctid] = gQv[c * self.dv_chunk + ctid, head_base + n]
+            qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
+            if ctid < self.hdim_rope:
+                for n in cutlass.range_constexpr(h):
+                    qt_rope[n, ctid] = gQr[ctid, head_base + n]
+        else:
+            # 16-byte vectors: this CTA's h heads x 512 latent dims, 8 dims per copy
+            gQt = cute.make_tensor(
+                elem_pointer(gQv, (0, head_base)),
+                cute.make_layout((h, self.hdimv), stride=(gQv.stride[1], gQv.stride[0])),
+            )
+            tiled_q = tiled_copy_2d(sQtC.element_type, self.dv_chunk, self.num_corr_threads)
+            thr_q = tiled_q.get_slice(ctid)
+            for c in cutlass.range_constexpr(self.num_chunks):
+                qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
+                gq_c = cute.local_tile(gQt, (h, self.dv_chunk), (0, c))
+                cute.copy(tiled_q, thr_q.partition_S(gq_c), thr_q.partition_D(qt_nd))
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.mbarrier_arrive(mbar_Q)
 
@@ -822,6 +1181,12 @@ class FlashAttentionMLADecodeSm100:
             fa_sm100_utils.fence_tcgen05_before_thread_sync()
             pl_O.consumer_release(cs_O)
             cs_O.advance()
+            pl_stats.consumer_release(cs_st)
+            cs_st.advance()
+
+        if const_expr(not self.has_rope):
+            # the final row sums arrive one stats stage after the last block's scale
+            pl_stats.consumer_wait(cs_st)
             pl_stats.consumer_release(cs_st)
             cs_st.advance()
 

@@ -35,27 +35,33 @@ SOFTMAX_SCALE = HEAD_SIZE**-0.5
 pytestmark = pytest.mark.skipif(not IS_SM100, reason="sparse MLA forward is SM100 only")
 
 
-def make_flat_kv(num_rows, device, dtype=torch.bfloat16, seed=0):
+def make_flat_kv(num_rows, device, dtype=torch.bfloat16, seed=0, rope_dim=QK_ROPE_HEAD_DIM):
+    """rope_dim == 0 is the rope-less (NoPE) absorbed shape: 512-wide rows, no k."""
     gen = torch.Generator(device=device).manual_seed(seed)
     kv = torch.randn(
-        num_rows, 1, HEAD_SIZE, device=device, dtype=torch.float32, generator=gen
+        num_rows, 1, KV_LORA_RANK + rope_dim, device=device, dtype=torch.float32, generator=gen
     ).to(dtype)
     # Last-dim-contiguous views; maybe_contiguous() must not copy them.
     v = kv[:, :, :KV_LORA_RANK]
-    k = kv[:, :, KV_LORA_RANK:]
-    assert v.stride(-1) == 1 and k.stride(-1) == 1
+    k = kv[:, :, KV_LORA_RANK:] if rope_dim else None
+    assert v.stride(-1) == 1 and (k is None or k.stride(-1) == 1)
     return kv, k, v
 
 
-def make_q(total_q, device, dtype=torch.bfloat16, seed=1, split_views=True, num_heads=NUM_HEADS):
+def make_q(
+    total_q, device, dtype=torch.bfloat16, seed=1, split_views=True, num_heads=NUM_HEADS,
+    rope_dim=QK_ROPE_HEAD_DIM,
+):
     gen = torch.Generator(device=device).manual_seed(seed)
     q_full = torch.randn(
-        total_q, num_heads, HEAD_SIZE, device=device, dtype=torch.float32, generator=gen
+        total_q, num_heads, KV_LORA_RANK + rope_dim, device=device, dtype=torch.float32,
+        generator=gen,
     ).to(dtype)
     qv = q_full[:, :, :KV_LORA_RANK]
-    q = q_full[:, :, KV_LORA_RANK:]
+    q = q_full[:, :, KV_LORA_RANK:] if rope_dim else None
     if not split_views:
-        qv, q = qv.contiguous(), q.contiguous()
+        qv = qv.contiguous()
+        q = q.contiguous() if q is not None else None
     return q, qv
 
 
@@ -74,27 +80,33 @@ def make_indices(valid_counts, num_rows, device, seed=2, topk=TOPK, pad=-1):
 
 
 def ref_sparse_mla(q, qv, kv, idx, valid_counts, softmax_scale=SOFTMAX_SCALE, upcast=True):
-    """Pure-torch attention over the gathered rows. Returns (out, lse) with lse in natural log."""
-    total_q = q.shape[0]
-    compute_dtype = torch.float32 if upcast else q.dtype
-    out = torch.zeros(total_q, q.shape[1], KV_LORA_RANK, device=q.device, dtype=q.dtype)
-    lse = torch.full((total_q, q.shape[1]), -math.inf, device=q.device, dtype=torch.float32)
+    """Pure-torch attention over the gathered rows. Returns (out, lse) with lse in natural log.
+
+    `q is None` is the rope-less (NoPE) shape: the score is qv @ v_g.T alone.
+    """
+    total_q, heads = qv.shape[0], qv.shape[1]
+    compute_dtype = torch.float32 if upcast else qv.dtype
+    out = torch.zeros(total_q, heads, KV_LORA_RANK, device=qv.device, dtype=qv.dtype)
+    lse = torch.full((total_q, heads), -math.inf, device=qv.device, dtype=torch.float32)
     for m in range(total_q):
         n = int(valid_counts[m])
         if n == 0:
             continue
         rows = idx[m, :n].long()
         assert (rows >= 0).all() and (rows < kv.shape[0]).all()
-        kv_g = kv[rows, 0, :].to(compute_dtype)  # (n, HEAD_SIZE)
+        kv_g = kv[rows, 0, :].to(compute_dtype)  # (n, KV_LORA_RANK + rope)
         v_g, k_g = kv_g[:, :KV_LORA_RANK], kv_g[:, KV_LORA_RANK:]
-        scores = (
-            q[m].to(compute_dtype) @ k_g.transpose(0, 1)
-            + qv[m].to(compute_dtype) @ v_g.transpose(0, 1)
-        ) * softmax_scale
+        if q is not None:
+            scores = (
+                q[m].to(compute_dtype) @ k_g.transpose(0, 1)
+                + qv[m].to(compute_dtype) @ v_g.transpose(0, 1)
+            ) * softmax_scale
+        else:
+            scores = (qv[m].to(compute_dtype) @ v_g.transpose(0, 1)) * softmax_scale
         scores = scores.float()
         lse[m] = torch.logsumexp(scores, dim=-1)
         p = torch.softmax(scores, dim=-1).to(compute_dtype)
-        out[m] = (p @ v_g).to(q.dtype)
+        out[m] = (p @ v_g).to(qv.dtype)
     return out, lse
 
 
@@ -103,7 +115,7 @@ def run_kernel(
     softmax_scale=SOFTMAX_SCALE, return_lse=True,
 ):
     batch = cu_seqlens_q.numel() - 1
-    device = q.device
+    device = qv.device
     return flash_attn_varlen_func(
         q,
         k,

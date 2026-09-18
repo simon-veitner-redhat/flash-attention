@@ -44,6 +44,11 @@ class CpasyncGatherKVManager(ParamsBase):
     rTopkHalf: cute.Tensor
     # for bitmask
     rTopk_NonInterleaved: cute.Tensor
+    # for prefetch_row_index / commit_row_ptrs / load_X(direct=True);
+    # None unless create(direct_rows=...) asked for them
+    rRowIdx: Optional[cute.Tensor]
+    rRowPtr: Optional[cute.Tensor]
+    rRowValid: Optional[cute.Tensor]
 
     pipeline_bitmask: Optional[pipeline.PipelineAsync]
     cpasync_barrier: Optional[pipeline.NamedBarrier]
@@ -69,6 +74,8 @@ class CpasyncGatherKVManager(ParamsBase):
         disable_bitmask: cutlass.Constexpr[Boolean] = False,
         sBitmask: Optional[cute.Tensor] = None,
         pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
+        # keep new parameters last: flash_fwd_mla_sm100.py passes the ones above positionally
+        direct_rows: cutlass.Constexpr[int] = 0,
     ):
         assert tile_n % num_threads == 0
         assert num_threads == 128
@@ -104,6 +111,13 @@ class CpasyncGatherKVManager(ParamsBase):
         rTopk = cute.make_rmem_tensor((topk_indices_per_thread,), Int32)
         rTopkHalf = cute.make_rmem_tensor((topk_indices_per_thread,), Int32)
         rTopk_NonInterleaved = cute.make_rmem_tensor((topk_indices_per_thread,), Int32)
+        if const_expr(direct_rows > 0):
+            rows_per_thread = direct_rows // (num_threads // gmem_threads_per_row)
+            rRowIdx = cute.make_rmem_tensor((rows_per_thread,), Int32)
+            rRowPtr = cute.make_rmem_tensor((rows_per_thread,), cutlass.Int64)
+            rRowValid = cute.make_rmem_tensor((rows_per_thread,), Int32)
+        else:
+            rRowIdx, rRowPtr, rRowValid = None, None, None
 
         return CpasyncGatherKVManager(
             mIndexTopk,
@@ -127,6 +141,9 @@ class CpasyncGatherKVManager(ParamsBase):
             rTopk,
             rTopkHalf,
             rTopk_NonInterleaved,
+            rRowIdx,
+            rRowPtr,
+            rRowValid,
             pipeline_bitmask,
             cpasync_barrier,
             disable_bitmask,
@@ -216,6 +233,29 @@ class CpasyncGatherKVManager(ParamsBase):
         return tPrXPtr, tPrRowValid
 
     @cute.jit
+    def prefetch_row_index(self, row_lo: Int32):
+        """Issue the index loads of the rows this thread will copy from tile ``row_lo``.
+
+        ``load_X`` writes tile row ``m * (num_threads // gmem_threads_per_row) +
+        thread_idx // gmem_threads_per_row`` at its mode-1 index ``m``, so reading that row's
+        index here lets ``load_X(direct=True)`` drop the per-``m`` index and pointer shuffles.
+        The ``gmem_threads_per_row`` threads of a row group read the same index (a broadcast).
+        Called one tile ahead so the load latency is covered by the previous tile's copies.
+        """
+        rows_per_pass = self.num_threads // self.gmem_threads_per_row
+        row = self.thread_idx // self.gmem_threads_per_row
+        for m in cutlass.range_constexpr(cute.size(self.rRowIdx)):
+            self.rRowIdx[m] = self.mIndexTopk[row_lo + m * rows_per_pass + row]
+
+    @cute.jit
+    def commit_row_ptrs(self, mX: cute.Tensor):
+        """Turn the prefetched indices into row pointers and validity flags for ``load_X``."""
+        for m in cutlass.range_constexpr(cute.size(self.rRowPtr)):
+            topk_idx = self.rRowIdx[m]
+            self.rRowValid[m] = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
+            self.rRowPtr[m] = utils.elem_pointer(mX, (topk_idx, 0)).toint()
+
+    @cute.jit
     def load_X(
         self,
         mX: cute.Tensor,
@@ -223,9 +263,19 @@ class CpasyncGatherKVManager(ParamsBase):
         transpose: bool,
         K_or_V: str,
         d_offset: int = 0,
+        rows: Optional[int] = None,
+        row_lo_lane=0,
+        direct: cutlass.Constexpr[bool] = False,
     ):
+        """``rows`` (a divisor of tile_n, non-transposed only) fills ``sX`` with that many
+        rows of the tile whose indices are loaded, starting at the row-group
+        ``row_lo_lane`` (row offset / rows-per-pass); the default fills the whole tile."""
         assert K_or_V in ("K", "V")
-        cta_tile_n = self.tile_n if const_expr(transpose) else self.tile_n // self.cta_group_size
+        if const_expr(rows is not None):
+            assert not transpose and self.cta_group_size == 1 and self.tile_n % rows == 0
+            cta_tile_n = rows
+        else:
+            cta_tile_n = self.tile_n if const_expr(transpose) else self.tile_n // self.cta_group_size
         head_dim = self.hdim if const_expr(K_or_V == "K") else self.hdim_v // self.num_hdimv_splits
         if const_expr(transpose):
             head_dim = head_dim // self.cta_group_size
@@ -238,7 +288,13 @@ class CpasyncGatherKVManager(ParamsBase):
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_nd)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
 
-        tPrXPtr, tPrRowValid = self.compute_X_ptr(mX, transpose, d_offset)
+        if const_expr(direct):
+            # pointers and validity already in registers from load_row_ptrs, at d_offset 0
+            assert not transpose and self.rRowPtr is not None
+            assert cute.size(tXsX, mode=[1]) == cute.size(self.rRowPtr)
+            d_offset_bytes = cutlass.Int64(d_offset * (mX.element_type.width // 8))
+        else:
+            tPrXPtr, tPrRowValid = self.compute_X_ptr(mX, transpose, d_offset)
 
         if const_expr(not transpose):
             offset = self.cta_rank_in_cluster * (self.gmem_threads_per_row // self.cta_group_size)
@@ -246,19 +302,29 @@ class CpasyncGatherKVManager(ParamsBase):
             offset = 0
 
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
-            if const_expr(not self.disable_bitmask):
-                row_valid = utils.shuffle_sync(
-                    tPrRowValid[m // self.gmem_threads_per_row],
-                    (m + offset) % self.gmem_threads_per_row,
+            if const_expr(direct):
+                if const_expr(not self.disable_bitmask):
+                    should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], Boolean)
+                    should_load.fill(Boolean(self.rRowValid[m]))
+                x_ptr_i64 = self.rRowPtr[m] + d_offset_bytes
+            else:
+                if const_expr(rows is not None):
+                    src = (m + row_lo_lane + offset) % self.gmem_threads_per_row
+                else:
+                    src = (m + offset) % self.gmem_threads_per_row
+                if const_expr(not self.disable_bitmask):
+                    row_valid = utils.shuffle_sync(
+                        tPrRowValid[m // self.gmem_threads_per_row],
+                        src,
+                        width=self.gmem_threads_per_row,
+                    )
+                    should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], Boolean)
+                    should_load.fill(Boolean(row_valid))
+                x_ptr_i64 = utils.shuffle_sync(
+                    tPrXPtr[m // self.gmem_threads_per_row],
+                    src,
                     width=self.gmem_threads_per_row,
                 )
-                should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], Boolean)
-                should_load.fill(Boolean(row_valid))
-            x_ptr_i64 = utils.shuffle_sync(
-                tPrXPtr[m // self.gmem_threads_per_row],
-                (m + offset) % self.gmem_threads_per_row,
-                width=self.gmem_threads_per_row,
-            )
             x_gmem_ptr = cute.make_ptr(
                 mX.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
             )

@@ -45,9 +45,9 @@ def decode_route(monkeypatch):
     )
 
 
-def ragged_counts(total_q):
+def ragged_counts(total_q, topk=TOPK):
     """Ragged top-k lengths including exact-zero rows and both tile-boundary cases."""
-    pattern = [TOPK, 0, 1, TILE_N, TILE_N + 1, TOPK - 1, 777, 0, 129, 1024]
+    pattern = [topk, 0, 1, TILE_N, TILE_N + 1, topk - 1, 777, 0, 129, 1024]
     return (pattern * (total_q // len(pattern) + 1))[:total_q]
 
 
@@ -60,16 +60,19 @@ def run_decode(q, qv, k, v, cu_seqlens_q, idx, valid_len, return_lse=True):
 def check(
     q_lens, counts, num_heads=16, split_views=True, seed=0,
     dtype=torch.bfloat16, use_valid_length=True, pad=-1,
+    rope_dim=64, topk=TOPK,
 ):
     device = "cuda"
     cu_seqlens_q = flat_kv.cu_seqlens_from(q_lens, device)
-    kv, k, v = flat_kv.make_flat_kv(NUM_KV_ROWS, device, dtype=dtype, seed=seed)
+    kv, k, v = flat_kv.make_flat_kv(
+        NUM_KV_ROWS, device, dtype=dtype, seed=seed, rope_dim=rope_dim,
+    )
     q, qv = flat_kv.make_q(
         sum(q_lens), device, dtype=dtype, seed=seed + 1,
-        split_views=split_views, num_heads=num_heads,
+        split_views=split_views, num_heads=num_heads, rope_dim=rope_dim,
     )
     idx, valid_len = flat_kv.make_indices(
-        counts, NUM_KV_ROWS, device, seed=seed + 2, pad=pad,
+        counts, NUM_KV_ROWS, device, seed=seed + 2, topk=topk, pad=pad,
     )
 
     out, lse = run_decode(
@@ -103,6 +106,39 @@ def test_decode_varlen_q_len_gt_1():
 @pytest.mark.parametrize("num_heads", [8, 16, 32])
 def test_decode_without_valid_length(dtype, num_heads):
     check([1] * 9, ragged_counts(9), num_heads=num_heads, dtype=dtype, use_valid_length=False)
+
+
+# (num_heads, total_q, topk): one per (per-CTA h, num_splits) band the split rule yields
+# at 148 SMs for the rope-less shape. 2176 == 17 x 128 is prime, so it never splits.
+NOPE_BANDS = [
+    (8, 9, 2048),     # h 8,  S 8
+    (16, 37, 2048),   # h 16, S 4
+    (16, 148, 2048),  # h 16, S 1
+    (32, 74, 2048),   # h 32, S 2
+    (32, 148, 2048),  # h 32, S 1
+    (64, 1, 2048),    # 64 heads -> 8 head groups
+    (8, 9, 2176),     # h 8,  S 1
+    (16, 148, 2176),  # h 16, S 1
+    (32, 148, 2176),  # h 32, S 1
+    (64, 19, 2176),   # h 16, S 1
+]
+
+
+@pytest.mark.parametrize("num_heads,total_q,topk", NOPE_BANDS)
+def test_decode_nope_latent_512(num_heads, total_q, topk):
+    """GLM-5.3-Flash shape: q=None, latent 512, rope 0, at every per-CTA head band."""
+    check(
+        [1] * total_q, ragged_counts(total_q, topk), num_heads=num_heads,
+        rope_dim=0, topk=topk, seed=7 * total_q,
+    )
+
+
+def test_decode_nope_without_valid_length():
+    """The `mTopkValidLen is None` compile variant of the rope-less kernel."""
+    check(
+        [1] * 9, ragged_counts(9), num_heads=16, rope_dim=0,
+        use_valid_length=False, seed=63,
+    )
 
 
 @pytest.mark.parametrize("pad", [-1, -2147483648, 1 << 20])

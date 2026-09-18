@@ -350,10 +350,10 @@ def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_block
     head_groups = next(g for g in (1, 2, 4, 8) if qhead_per_kvhead // g in supported)
     ctas = total_q * nheads_kv * head_groups
     # minimize waves per split, with at least two blocks per split and at most one extra wave
+    # (the kernel balances a block count the split count does not divide, e.g. 17 = 2*7 + 3)
     splits, best_cost, candidate = 1, waves(ctas), 2
     while (
-        num_n_blocks % candidate == 0
-        and num_n_blocks // candidate >= 2
+        num_n_blocks // candidate >= 2
         and waves(ctas * candidate) <= waves(ctas) + 1
     ):
         cost = waves(ctas * candidate) / candidate
@@ -1008,7 +1008,6 @@ def _flash_attn_fwd(
     # under 128 query heads per KV head only the decode kernel runs DSA gather natively
     use_decode = (
         qv is not None
-        and q is not None
         and gather_kv_indices is not None
         and cu_seqlens_q is not None
         and cu_seqlens_k is not None
@@ -1019,7 +1018,8 @@ def _flash_attn_fwd(
         and not causal
         and not local
         and arch // 10 in [10, 11]
-        and head_dim == 64
+        # rope 64 + latent 512 (DeepSeek), or q=None with a 512-wide query (rope-less MLA)
+        and head_dim == (64 if q is not None else 512)
         and head_dim_v == 512
         and qhead_per_kvhead in (8, 16, 32, 64)
         and output_quant_key is None
@@ -1472,7 +1472,8 @@ def _flash_attn_fwd(
         # fp8_kv_dequant forces compute dtype = fp16, so the Q/O tensor dtypes (which the
         # kernel derives from mQ/mO and which select the in-kernel narrow/widen) are no
         # longer captured by `dtype` above -- key on them explicitly. Redundant elsewhere.
-        q.dtype,
+        # q_dtype, not q.dtype: q is None on the rope-less MLA paths.
+        q_dtype,
         out_torch_dtype,
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
@@ -1637,6 +1638,7 @@ def _flash_attn_fwd(
                     qhead_per_kvhead=qhead_per_kvhead,
                     num_splits=num_splits,
                     num_head_groups=decode_splits[0],
+                    hdim_rope=64 if q is not None else 0,
                 )
             elif qv is not None:
                 paged_kv_cpasync = page_table is not None and page_size != tile_n
@@ -3884,8 +3886,8 @@ def flash_attn_func(
 
 
 def flash_attn_varlen_func(
-    q: torch.Tensor,
-    k: torch.Tensor,
+    q: Optional[torch.Tensor],
+    k: Optional[torch.Tensor],
     v: torch.Tensor,
     qv: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -3961,6 +3963,9 @@ def flash_attn_varlen_func(
         computing metadata fresh.
 
     gather_kv_valid_length: leading valid entries per row; entries past it must be out of range.
+
+    q and k may be None for rope-less absorbed MLA (head_dim is then taken from qv); on the
+        top-k decode path this selects the rope-less kernel variant.
     """
     return FlashAttnVarlenFunc.apply(
         q,
