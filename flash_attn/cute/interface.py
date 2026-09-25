@@ -4,7 +4,7 @@
 import os
 import math
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Optional, Tuple, Callable
 
 import torch
@@ -55,6 +55,10 @@ from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
 from flash_attn.cute.flash_fwd_mla_decode_sm100 import FlashAttentionMLADecodeSm100
+from flash_attn.cute.flash_fwd_mla_decode_h64_sm100 import (
+    FlashAttentionMLADecodeH64Sm100,
+    MIN_BLK_PER_SPLIT,
+)
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
@@ -343,8 +347,105 @@ def _make_compile_only_tensor_spec(
     )
 
 
-def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks):
-    """Choose head groups and KV splits for the sparse decode grid."""
+_H64_SLOTS_SRC = (
+    b'extern "C" __global__ void __launch_bounds__(384, 1) k() { extern __shared__ char s[]; }'
+)
+
+
+@cache
+def _h64_cluster_slots(device_index: int, cluster_size: int) -> Optional[int]:
+    """How many clusters of cluster_size CTAs of the 64-head decode kernel (384 threads, its
+    dynamic smem: one CTA per SM) the device runs at once, from cuOccupancyMaxActiveClusters on a
+    trivial NVRTC kernel with the same launch shape.  Cached per (device, S); about 10 ms per S on
+    the first call (NVRTC compile; vLLM's warmup makes it eagerly).  None when the query cannot
+    run (no driver or NVRTC): mla_decode_splits then uses a conservative estimate."""
+    try:
+        from cuda.bindings import driver as cu, nvrtc
+
+        def ok(res):
+            if int(res[0]) != 0:
+                raise RuntimeError(f"cluster slot query failed: {res}")
+            return res[1] if len(res) == 2 else res[1:]
+
+        smem = FlashAttentionMLADecodeH64Sm100()._get_shared_storage_cls().size_in_bytes()
+        ok(cu.cuInit(0))
+        dev = ok(cu.cuDeviceGet(device_index))
+        major = ok(cu.cuDeviceGetAttribute(
+            cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev))
+        minor = ok(cu.cuDeviceGetAttribute(
+            cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev))
+        prog = ok(nvrtc.nvrtcCreateProgram(_H64_SLOTS_SRC, b"slots.cu", 0, [], []))
+        ok(nvrtc.nvrtcCompileProgram(prog, 1, [f"--gpu-architecture=sm_{major}{minor}".encode()]))
+        cubin = b" " * ok(nvrtc.nvrtcGetCUBINSize(prog))
+        ok(nvrtc.nvrtcGetCUBIN(prog, cubin))
+        ok(nvrtc.nvrtcDestroyProgram(prog))
+        ctx = ok(cu.cuDevicePrimaryCtxRetain(dev))
+        try:
+            ok(cu.cuCtxPushCurrent(ctx))
+            try:
+                mod = ok(cu.cuModuleLoadData(cubin))
+                try:
+                    func = ok(cu.cuModuleGetFunction(mod, b"k"))
+                    attr = cu.CUfunction_attribute
+                    ok(cu.cuFuncSetAttribute(
+                        func, attr.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem))
+                    cfg = cu.CUlaunchConfig()
+                    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = cluster_size, 1, 1
+                    cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 384, 1, 1
+                    cfg.sharedMemBytes = smem
+                    cl = cu.CUlaunchAttribute()
+                    cl.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                    cl.value.clusterDim.x, cl.value.clusterDim.y, cl.value.clusterDim.z = (
+                        cluster_size, 1, 1
+                    )
+                    cfg.attrs = [cl]
+                    cfg.numAttrs = 1
+                    return int(ok(cu.cuOccupancyMaxActiveClusters(func, cfg)))
+                finally:
+                    cu.cuModuleUnload(mod)
+            finally:
+                cu.cuCtxPopCurrent()
+        finally:
+            cu.cuDevicePrimaryCtxRelease(dev)
+    except Exception:
+        return None
+
+
+def _h64_cluster_slots_fn(device_index: int):
+    """cluster_slots for mla_decode_splits: the device query, or None (the conservative estimate)
+    under a FLASH_ATTENTION_NUM_SMS override.  Without the override the local GPU is the target:
+    the call site's get_num_sms_for_selection, evaluated first, raises otherwise."""
+    if os.getenv("FLASH_ATTENTION_NUM_SMS") is not None:
+        return None
+    return lambda s: _h64_cluster_slots(device_index, s)
+
+
+def mla_decode_splits(
+    total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks, mla_decode_h64=False,
+    cluster_slots=None,
+):
+    """Choose head groups and KV splits for the sparse decode grid.
+
+    mla_decode_h64: the call runs the 64-head heads-on-M kernel (FlashAttentionMLADecodeH64Sm100;
+    _flash_attn_fwd decides).  It has no head groups and 64-row blocks.  16 or 8 splits (fp32
+    partials and flash_fwd_combine) while the grid fits one wave, with at least 2 blocks per
+    split; else 4, 3 or 2 (combined in the kernel, one cluster of S CTAs per row) while every
+    cluster is resident at once, with at least MIN_BLK_PER_SPLIT (4) blocks per split.  Resident
+    clusters: cluster_slots(S) (_h64_cluster_slots_fn), or 0.85 * num_SMs / S when it is None or
+    gives None, and never more than num_SMs / S.  Else 1.
+    """
+    if mla_decode_h64:
+        rows, nblk = total_q * nheads_kv, 2 * num_n_blocks
+        for s in (16, 8):
+            if 2 * s <= nblk and rows * s <= num_SMs:
+                return 1, s
+        for s in (4, 3, 2):
+            slots = cluster_slots(s) if cluster_slots is not None else None
+            if slots is None:
+                slots = int(0.85 * num_SMs) // s
+            if MIN_BLK_PER_SPLIT * s <= nblk and rows <= min(slots, num_SMs // s):
+                return 1, s
+        return 1, 1
     supported = FlashAttentionMLADecodeSm100.SUPPORTED_HEADS
     waves = lambda ctas: -(-ctas // num_SMs)
     head_groups = next(g for g in (1, 2, 4, 8) if qhead_per_kvhead // g in supported)
@@ -678,6 +779,7 @@ def _flash_attn_fwd(
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
+    mla_decode_h64: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -1025,15 +1127,30 @@ def _flash_attn_fwd(
         and output_quant_key is None
     )
     decode_splits = None
+    # the opt-in heads-on-M kernel runs 64 query heads per KV head; any other call ignores the flag
+    mla_decode_h64 = use_decode and mla_decode_h64 and qhead_per_kvhead == 64
     if use_decode:
         decode_splits = mla_decode_splits(
             total_q, num_head_kv, qhead_per_kvhead,
             get_num_sms_for_selection(device.index, arch),
             gather_kv_indices.shape[-1] // 128,
+            # only when set: a call without the flag keeps its exact call shape.  Arch guard: see
+            # _h64_cluster_slots_fn
+            **(
+                {
+                    "mla_decode_h64": True,
+                    "cluster_slots": _h64_cluster_slots_fn(device.index),
+                }
+                if mla_decode_h64
+                else {}
+            ),
         )
         num_splits = decode_splits[1]
 
-    is_split_kv = num_splits > 1
+    # the 64-head kernel combines 2-4 splits itself: it writes the final O and LSE, no partials
+    is_split_kv = num_splits > 1 and not (
+        mla_decode_h64 and FlashAttentionMLADecodeH64Sm100.combines_in_kernel(num_splits)
+    )
     if is_split_kv:
         # flash_fwd_combine wants the query dim contiguous in the partial LSE; qv has it first
         lse_partial_shape = (
@@ -1477,6 +1594,8 @@ def _flash_attn_fwd(
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
     )
+    if mla_decode_h64:
+        compile_key += ("mla_decode_h64",)
     if use_dedicated_hd256_kernel:
         compile_key += (
             hd256_varlen_b1,
@@ -1631,7 +1750,12 @@ def _flash_attn_fwd(
                 assert not use_dedicated_hd256_kernel, (
                     "fused FP8 output + head_dim=256 kernel not supported yet"
                 )
-            if qv is not None and use_decode:
+            if mla_decode_h64:
+                fa_fwd = FlashAttentionMLADecodeH64Sm100(
+                    topk_length=gather_kv_length,
+                    num_splits=num_splits,
+                )
+            elif qv is not None and use_decode:
                 fa_fwd = FlashAttentionMLADecodeSm100(
                     topk_length=gather_kv_length,
                     qhead_per_kvhead=qhead_per_kvhead,
@@ -3681,6 +3805,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         scheduler_metadata: Optional["SchedulerMetadataTensorsTorch"] = None,
         seqlen_k_per_split: Optional[int] = None,
         disable_scheduler_metadata: bool = False,
+        mla_decode_h64: bool = False,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3724,6 +3849,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             scheduler_metadata=scheduler_metadata,
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
+            mla_decode_h64=mla_decode_h64,
         )
         ctx.save_for_backward(
             q,
@@ -3790,9 +3916,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 min_seqlen_k=ctx.min_seqlen_k,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 30)
+                return dqv, dv, None, None, *((None,) * 31)
             else:
-                return dq, dk, dv, dqv, *((None,) * 30)
+                return dq, dk, dv, dqv, *((None,) * 31)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3826,7 +3952,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 13), dsink, *((None,) * 16)
+            return dq, dk, dv, None, *((None,) * 13), dsink, *((None,) * 17)
 
 
 def flash_attn_func(
@@ -3918,6 +4044,7 @@ def flash_attn_varlen_func(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_kv_valid_length: Optional[torch.Tensor] = None,
+    mla_decode_h64: bool = False,
 ):
     """
     Tensor arguments:
@@ -3961,6 +4088,9 @@ def flash_attn_varlen_func(
         computing metadata fresh.
 
     gather_kv_valid_length: leading valid entries per row; entries past it must be out of range.
+
+    mla_decode_h64: with 64 query heads per KV head, run the sparse decode on the heads-on-M kernel
+        (FlashAttentionMLADecodeH64Sm100) instead of the transposed one.
     """
     return FlashAttnVarlenFunc.apply(
         q,
@@ -3997,6 +4127,7 @@ def flash_attn_varlen_func(
         scheduler_metadata,
         seqlen_k_per_split,
         disable_scheduler_metadata,
+        mla_decode_h64,
     )
 
 

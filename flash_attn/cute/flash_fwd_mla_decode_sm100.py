@@ -13,7 +13,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float32, Int32, Int64, const_expr
-from cutlass.cute.nvgpu import tcgen05
+from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import CtaGroup, OperandMajorMode
 
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
@@ -28,7 +28,7 @@ LN2 = math.log(2.0)
 SMEM_CAP_BYTES = 232448  # the measured SM100 dynamic-smem ceiling
 
 # h -> (latent ring depth, P^T aliased onto the rope ring).  n_rope = n_pt = 1 always.
-_RING = {8: (6, False), 16: (6, True), 32: (5, False)}
+_RING = {8: (6, False), 16: (6, True), 32: (5, False), 64: (4, True)}
 
 
 class FlashAttentionMLADecodeSm100:
@@ -89,6 +89,7 @@ class FlashAttentionMLADecodeSm100:
         self.bar_id_tmem = 1
         self.bar_id_softmax = 2
         self.bar_id_corr = 3
+        self.bar_id_sum_final = 4  # early_stats only: final sSmSum write -> epilogue read
 
         self.num_stages_stats = 2
 
@@ -100,6 +101,22 @@ class FlashAttentionMLADecodeSm100:
         assert self.tmem_off_O[-1] + self.h <= self.tmem_alloc_cols
 
         self.buffer_align_bytes = 1024
+
+        # ---- h == 64 only (h <= 32 PTX unchanged) ----------------------------------
+        # Q^T by 16-byte cp.async instead of h scalar LDG + STS per thread
+        self.q_async = self.h == 64
+        # commit the stats stage once sScale is written: correction's O rescale overlaps
+        # the exp2 / row-sum / P^T phase.  The epilogue's sSmSum read is then ordered by
+        # bar_id_sum_final instead of the last stats commit.
+        self.early_stats = self.h == 64
+        # transposed butterfly for the per-head block max and row sum (62 SHFL, not 10 * h)
+        self.x_reduce = self.h == 64
+        # setmaxnreg per warpgroup: softmax, correction, MMA (+ idle warps 9-11), gather
+        self.set_regs = self.h == 64
+        self.num_regs_softmax = 160
+        self.num_regs_correction = 160
+        self.num_regs_mma = 96
+        self.num_regs_gather = 96
 
     # ------------------------------------------------------------------ traced setup
     @cute.jit
@@ -223,6 +240,11 @@ class FlashAttentionMLADecodeSm100:
         )
 
         n_lat, alias_pt = _RING[self.h]
+        # S^T(b) pins all num_chunks latent stages until PV(b) releases them: a shallower
+        # ring deadlocks the gather against the MMA warp
+        assert n_lat >= self.num_chunks, (
+            f"h={self.h}: latent ring depth {n_lat} < num_chunks={self.num_chunks} deadlocks"
+        )
         SharedStorage = self._get_shared_storage_cls(dtype, n_lat, alias_pt)
         smem_bytes = SharedStorage.size_in_bytes()
         assert smem_bytes <= SMEM_CAP_BYTES, (
@@ -422,25 +444,41 @@ class FlashAttentionMLADecodeSm100:
         ]
 
         # ==== role dispatch =========================================================
+        # setmaxnreg sits inside each role branch: hoisted into its own if-chain, ptxas
+        # sizes every role at the minimum
         if warp_idx < self.corr_warp_lo:
+            if const_expr(self.set_regs):
+                cute.arch.setmaxregister_increase(self.num_regs_softmax)
             self.softmax_loop(
                 mIndexTopk, mma_S, accS, sRed, sSmMax, sSmSum, sScale, sPt,
                 pl_S, pl_P, pl_stats, tidx, warp_idx, m_idx, seqlen_k_limit,
                 softmax_scale_log2, n_block_lo, num_n_blocks,
             )
         elif warp_idx < self.mma_warp_id:
+            if const_expr(self.set_regs):
+                cute.arch.setmaxregister_increase(self.num_regs_correction)
             self.corr_epilogue_loop(
                 mQ, mQv, mO, mLSE, mma_O, accO, sQtC, sQtR,
                 sScale, sSmMax, sSmSum, sInv, pl_O, pl_stats, mbar_Q,
                 tidx, head_kv, m_idx, hg_idx, split_idx,
                 softmax_scale_log2, num_n_blocks,
             )
-        elif warp_idx == self.mma_warp_id:
-            self.mma_loop(
-                mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
-                pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
-            )
+        elif (
+            warp_idx < self.gather_warp_lo if const_expr(self.set_regs)
+            else warp_idx == self.mma_warp_id
+        ):
+            if const_expr(self.set_regs):
+                # warps 8-11 all take this branch: the PTX ISA wants the same setmaxnreg
+                # executed by every warp of the warpgroup.  Warps 9-11 idle.
+                cute.arch.setmaxregister_decrease(self.num_regs_mma)
+            if const_expr(not self.set_regs) or warp_idx == self.mma_warp_id:
+                self.mma_loop(
+                    mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
+                    pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
+                )
         elif warp_idx >= self.gather_warp_lo:
+            if const_expr(self.set_regs):
+                cute.arch.setmaxregister_decrease(self.num_regs_gather)
             self.gather_loop(
                 mIndexTopk, mK, mV, sLatK, sRope, pl_lat, pl_rope,
                 tidx, warp_idx, m_idx, seqlen, batch_idx, head_kv, seqlen_k_limit,
@@ -525,7 +563,7 @@ class FlashAttentionMLADecodeSm100:
             pipeline.make_pipeline_state(Producer, 1),
         )
 
-        # Q^T is filled by the correction warps with plain STS
+        # Q^T is filled by the correction warps (plain STS, or cp.async under q_async)
         cute.arch.mbarrier_wait(mbar_Q, Int32(0))
 
         states = self._mma_block(
@@ -602,6 +640,44 @@ class FlashAttentionMLADecodeSm100:
         cs_P.advance()
         return cs_lat, use_lat, cs_rope, cs_P, ps_S, ps_O
 
+    @cute.jit
+    def _xreduce(self, src, dst, op, lane_idx):
+        """Transposed warp butterfly over src[0:h]: each step sends the half this lane gives
+        up and keeps the other, so the value set halves.  Ends with dst[j] = op over the warp
+        of head lane_idx * (h // 32) + j, for j < h // 32.  src is only read."""
+        m = self.h
+        for step in cutlass.range_constexpr(5):
+            t = dst
+            if const_expr(step == 0):
+                t = src
+            o = 16 >> step
+            half = m // 2
+            upper = (lane_idx & o) != 0
+            for i in cutlass.range_constexpr(half):
+                lo_v = t[i]
+                hi_v = t[i + half]
+                send = lo_v if upper else hi_v
+                keep = hi_v if upper else lo_v
+                dst[i] = op(keep, cute.arch.shuffle_sync_bfly(send, offset=o))
+            m = half
+
+    @cute.jit
+    def _reduce_heads_to_sred(self, src, dst, op, sRed, warp_idx, lane_idx):
+        """op over the warp's 32 lanes for each of the h heads in src; sRed[warp, head] gets
+        the result.  dst is scratch."""
+        h = const_expr(self.h)
+        if const_expr(self.x_reduce):
+            # lane L ends with heads L * (h // 32) + j
+            self._xreduce(src, dst, op, lane_idx)
+            for j in cutlass.range_constexpr(h // 32):
+                sRed[warp_idx, lane_idx * (h // 32) + j] = dst[j]
+        else:
+            for i in cutlass.range_constexpr(h):
+                dst[i] = warp_reduce(src[i], op)
+            if lane_idx == 0:
+                for i in cutlass.range_constexpr(h):
+                    sRed[warp_idx, i] = dst[i]
+
     # ================================================================ softmax warps
     @cute.jit
     def softmax_loop(
@@ -648,6 +724,12 @@ class FlashAttentionMLADecodeSm100:
                 pl_S, pl_P, pl_stats, states, tidx, warp_idx, lane_idx,
                 seqlen_k_limit, softmax_scale_log2, n_block_lo + i + 1, False,
             )
+        if const_expr(self.early_stats):
+            # the last block's sSmSum write is done: release it to the epilogue
+            pipeline.NamedBarrier(
+                barrier_id=self.bar_id_sum_final,
+                num_threads=self.num_softmax_threads + self.num_corr_threads,
+            ).arrive()
         _, ps_P, ps_st = states
         pl_P.producer_tail(ps_P)
         pl_stats.producer_tail(ps_st)
@@ -682,11 +764,7 @@ class FlashAttentionMLADecodeSm100:
             tSrS[i] = tSrS[i] if key_valid else -Float32.inf
 
         # ---- block max per head across the 128 lanes: warp butterfly + smem -------
-        for i in cutlass.range_constexpr(h):
-            tSrP[i] = warp_reduce(tSrS[i], cute.arch.fmax)
-        if lane_idx == 0:
-            for i in cutlass.range_constexpr(h):
-                sRed[warp_idx, i] = tSrP[i]
+        self._reduce_heads_to_sred(tSrS, tSrP, cute.arch.fmax, sRed, warp_idx, lane_idx)
         bar_sm.arrive_and_wait()
 
         pl_stats.producer_acquire(ps_st)
@@ -709,6 +787,9 @@ class FlashAttentionMLADecodeSm100:
                     if m_old != -Float32.inf else Float32(0.0)
                 )
         bar_sm.arrive_and_wait()
+        if const_expr(self.early_stats):
+            # correction(b) reads only sScale; sSmSum is fenced by bar_id_sum_final
+            pl_stats.producer_commit(ps_st)
 
         # ---- P = exp2(S * scale_log2 - m_new * scale_log2) ------------------------
         for i in cutlass.range_constexpr(h):
@@ -719,11 +800,7 @@ class FlashAttentionMLADecodeSm100:
             tSrP[i] = cute.math.exp2(tSrS[i] * softmax_scale_log2 + bias, fastmath=True)
 
         # ---- row sum per head across the 128 lanes -------------------------------
-        for i in cutlass.range_constexpr(h):
-            tSrS[i] = warp_reduce(tSrP[i], operator.add)
-        if lane_idx == 0:
-            for i in cutlass.range_constexpr(h):
-                sRed[warp_idx, i] = tSrS[i]
+        self._reduce_heads_to_sred(tSrP, tSrS, operator.add, sRed, warp_idx, lane_idx)
 
         # ---- P^T staging: this thread's key, all h heads, MN-major ---------------
         pl_P.producer_acquire(ps_P)
@@ -745,7 +822,8 @@ class FlashAttentionMLADecodeSm100:
                 sSmSum[tidx] = sSmSum[tidx] * sScale[st_idx, tidx] + s
         # the next block's sRed writes must not race this block's row-sum reads
         bar_sm.arrive_and_wait()
-        pl_stats.producer_commit(ps_st)
+        if const_expr(not self.early_stats):
+            pl_stats.producer_commit(ps_st)
         ps_st.advance()
         return cs_S, ps_P, ps_st
 
@@ -770,14 +848,42 @@ class FlashAttentionMLADecodeSm100:
         qtr_layout = cute.make_ordered_layout((h, self.hdim_rope), order=(0, 1))
         gQv = mQv[m_idx, None, None]  # (512, h_total)
         gQr = mQ[m_idx, None, None]  # (64,  h_total)
-        for c in cutlass.range_constexpr(self.num_chunks):
-            qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
-            for n in cutlass.range_constexpr(h):
-                qt_nd[n, ctid] = gQv[c * self.dv_chunk + ctid, head_base + n]
-        qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
-        if ctid < self.hdim_rope:
-            for n in cutlass.range_constexpr(h):
-                qt_rope[n, ctid] = gQr[ctid, head_base + n]
+        if const_expr(self.q_async):
+            # 16 B per cp.async along the contiguous d dim, .cg: Q is read once per CTA.
+            # A row of threads spans hdim_rope, which also divides dv_chunk.
+            q_elems = 128 // sQtC.element_type.width
+            q_atom = cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+                sQtC.element_type, num_bits_per_copy=128,
+            )
+            q_cols = self.hdim_rope // q_elems
+            q_thr = cute.make_ordered_layout(
+                (self.num_corr_threads // q_cols, q_cols), order=(1, 0)
+            )
+            q_tiled = cute.make_tiled_copy_tv(q_atom, q_thr, cute.make_layout((1, q_elems)))
+            q_cp = q_tiled.get_slice(ctid)
+            # (d, h_total) -> (h_total, d): tile (h, d) at head block head_base // h
+            gQv_hd = cute.make_tensor(gQv.iterator, cute.select(gQv.layout, mode=[1, 0]))
+            gQr_hd = cute.make_tensor(gQr.iterator, cute.select(gQr.layout, mode=[1, 0]))
+            hblk = head_base // h
+            for c in cutlass.range_constexpr(self.num_chunks):
+                gq = cute.local_tile(gQv_hd, (h, self.dv_chunk), (hblk, c))
+                qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
+                cute.copy(q_tiled, q_cp.partition_S(gq), q_cp.partition_D(qt_nd))
+            gq = cute.local_tile(gQr_hd, (h, self.hdim_rope), (hblk, 0))
+            qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
+            cute.copy(q_tiled, q_cp.partition_S(gq), q_cp.partition_D(qt_rope))
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+        else:
+            for c in cutlass.range_constexpr(self.num_chunks):
+                qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
+                for n in cutlass.range_constexpr(h):
+                    qt_nd[n, ctid] = gQv[c * self.dv_chunk + ctid, head_base + n]
+            qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
+            if ctid < self.hdim_rope:
+                for n in cutlass.range_constexpr(h):
+                    qt_rope[n, ctid] = gQr[ctid, head_base + n]
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.mbarrier_arrive(mbar_Q)
 
@@ -827,6 +933,12 @@ class FlashAttentionMLADecodeSm100:
 
         # ---- epilogue: O^T(n-1) is final -----------------------------------------
         pl_O.consumer_wait(cs_O)
+        if const_expr(self.early_stats):
+            # O^T(n-1) and the last stats commit both precede softmax's final sSmSum write
+            pipeline.NamedBarrier(
+                barrier_id=self.bar_id_sum_final,
+                num_threads=self.num_softmax_threads + self.num_corr_threads,
+            ).arrive_and_wait()
         if ctid < h:
             rs = sSmSum[ctid]
             bad = rs == 0.0 or rs != rs

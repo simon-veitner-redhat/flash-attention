@@ -30,6 +30,10 @@ def _get_gpu_ids():
 
 
 def pytest_configure(config):
+    config.addinivalue_line("markers", "h64: every call routes to the 64-head heads-on-M decode")
+    config.addinivalue_line(
+        "markers", "skip_route_check: the test checks its own decode routes, or makes no call"
+    )
     tmp = Path(tempfile.gettempdir()) / getuser() / "flash_attention_tests"
     tmp.mkdir(parents=True, exist_ok=True)
 

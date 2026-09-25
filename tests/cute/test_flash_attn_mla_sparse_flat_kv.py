@@ -100,7 +100,7 @@ def ref_sparse_mla(q, qv, kv, idx, valid_counts, softmax_scale=SOFTMAX_SCALE, up
 
 def run_kernel(
     q, qv, k, v, cu_seqlens_q, num_kv_rows, idx, valid_len,
-    softmax_scale=SOFTMAX_SCALE, return_lse=True,
+    softmax_scale=SOFTMAX_SCALE, return_lse=True, mla_decode_h64=False,
 ):
     batch = cu_seqlens_q.numel() - 1
     device = q.device
@@ -119,6 +119,7 @@ def run_kernel(
         gather_kv_valid_length=valid_len,
         softmax_scale=softmax_scale,
         return_lse=return_lse,
+        mla_decode_h64=mla_decode_h64,
     )
 
 
@@ -141,6 +142,16 @@ def assert_close(out, lse, out_ref, lse_ref, out_pt, valid_counts):
     pt_err = (o_pt - o_ref).abs().max().item()
     err = (o - o_ref).abs().max().item()
     assert err <= 2 * pt_err + 1e-3, f"out max diff {err} vs torch-bf16 {pt_err}"
+    # per row, relative to that row's |ref|: the check above is set by the largest rows (few
+    # keys, |out| ~ 3), so a full-top-k row (|out| ~ 0.25) could be off by several percent.
+    # 1e-2 clears one bf16 ulp (at most 2^-7 of |ref|), which is all the fp32 kernel shows.
+    row_err = (o - o_ref).abs().amax(dim=(1, 2))
+    row_tol = 1e-2 * o_ref.abs().amax(dim=(1, 2)) + 1e-3
+    bad = (row_err > row_tol).nonzero().flatten().tolist()
+    assert not bad, (
+        f"rows {[nonzero[i] for i in bad]}: out max diff {row_err[bad].tolist()} "
+        f"exceeds {row_tol[bad].tolist()}"
+    )
     lse_err = (lse[sel] - lse_ref[sel]).abs().max().item()
     assert lse_err <= 5e-3, f"lse max diff {lse_err}"
 
