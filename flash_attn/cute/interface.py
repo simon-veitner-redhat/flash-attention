@@ -733,6 +733,10 @@ def _flash_attn_fwd(
         fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
         if any(t is not None and t.dtype in fp8_dtypes for t in (q, k, v)):
             raise NotImplementedError("SM100 head_dim 512 does not support FP8 inputs")
+        if requires_grad:
+            raise NotImplementedError("SM100 head_dim 512 does not support backward (forward-only)")
+        if block_sparse_tensors is not None:
+            raise NotImplementedError("SM100 head_dim 512 does not support block sparsity")
         q, qv = None, q
         num_splits = 1
         # The MLA kernel keeps LSE heads-contiguous; callers see the usual (.., h, s).
@@ -867,6 +871,18 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
+    if gqa_on_mla:
+        if 128 % qhead_per_kvhead != 0:
+            raise NotImplementedError(
+                "SM100 head_dim 512 supports num_head / num_head_kv in (1, 2, 4, ..., 128), "
+                f"got {qhead_per_kvhead}"
+            )
+        if qhead_per_kvhead == 128 and cu_seqlens_q is not None and seqused_q is not None:
+            raise NotImplementedError(
+                "SM100 head_dim 512 with 128 query heads per KV head does not support seqused_q with cu_seqlens_q"
+            )
+        # Packed GQA gives the MLA kernel a seqlen-bounded O store for varlen Q.
+        pack_gqa = True
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not fp8_kv_dequant
     if is_fp8 and requires_grad:

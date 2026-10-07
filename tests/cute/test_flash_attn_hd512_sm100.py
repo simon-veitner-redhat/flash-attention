@@ -114,3 +114,79 @@ def test_hd512_gqa_rejects_fp8(fp8_dtype):
             max_seqlen_k=64,
             page_table=block_table,
         )
+
+
+# MHA (one query head per KV head) with varlen Q: O must not spill past seqused_q.
+@pytest.mark.parametrize("page", [16, 128])
+@pytest.mark.parametrize("qlens", [[100, 37, 200], [64, 128, 64]])
+@pytest.mark.parametrize("causal", [False, True])
+def test_hd512_mha_varlen_seqused_q(page, qlens, causal):
+    torch.manual_seed(0)
+    h, seqlen_k, sentinel = 4, 1000, 7.0
+    _, kc, vc, block_table, _, seqused_k = _paged_inputs(len(qlens), 1, seqlen_k, page, h, h)
+    q = torch.randn(sum(qlens), h, D, device=DEV, dtype=DT)
+    starts = [sum(qlens[:b]) for b in range(len(qlens))]
+    cu_q = torch.tensor(starts + [sum(qlens)], device=DEV, dtype=torch.int32)
+    used = [qlens[0], 0, qlens[2] // 2]
+    out = torch.full_like(q, sentinel)
+    scale = D**-0.5
+    _flash_attn_fwd(
+        q, kc, vc,
+        out=out,
+        cu_seqlens_q=cu_q,
+        seqused_q=torch.tensor(used, device=DEV, dtype=torch.int32),
+        seqused_k=seqused_k,
+        max_seqlen_q=max(qlens),
+        max_seqlen_k=seqlen_k,
+        page_table=block_table,
+        softmax_scale=scale,
+        causal=causal,
+    )
+    for b, (start, n) in enumerate(zip(starts, used)):
+        assert (out[start + n : start + qlens[b]] == sentinel).all()
+        if n > 0:
+            ref, _ = _reference(
+                q[start : start + n], kc, vc, block_table[b : b + 1], n, seqlen_k, scale, [causal]
+            )
+            assert _rel_err(out[start : start + n], ref) < 1e-2
+
+
+@pytest.mark.parametrize("hq,hkv", [(6, 2), (12, 1)])
+def test_hd512_gqa_rejects_head_ratio(hq, hkv):
+    q, kc, vc, block_table, cu_q, seqused_k = _paged_inputs(1, 16, 64, 16, hq, hkv)
+    with pytest.raises(NotImplementedError, match="num_head / num_head_kv"):
+        _flash_attn_fwd(
+            q, kc, vc,
+            cu_seqlens_q=cu_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=16,
+            max_seqlen_k=64,
+            page_table=block_table,
+        )
+
+
+def test_hd512_mqa128_rejects_seqused_q():
+    q, kc, vc, block_table, cu_q, seqused_k = _paged_inputs(2, 16, 64, 16, 128, 1)
+    with pytest.raises(NotImplementedError, match="seqused_q"):
+        _flash_attn_fwd(
+            q, kc, vc,
+            cu_seqlens_q=cu_q,
+            seqused_q=torch.tensor([16, 0], device=DEV, dtype=torch.int32),
+            seqused_k=seqused_k,
+            max_seqlen_q=16,
+            max_seqlen_k=64,
+            page_table=block_table,
+        )
+
+
+def test_hd512_gqa_rejects_backward():
+    q, kc, vc, block_table, cu_q, seqused_k = _paged_inputs(1, 16, 64, 16)
+    with pytest.raises(NotImplementedError, match="backward"):
+        _flash_attn_fwd(
+            q.requires_grad_(), kc, vc,
+            cu_seqlens_q=cu_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=16,
+            max_seqlen_k=64,
+            page_table=block_table,
+        )

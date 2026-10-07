@@ -917,6 +917,26 @@ class FlashAttentionMLAForwardSm100:
             if warp_idx == 0:
                 cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
 
+        # Init the CLC mbarriers before the cluster arrive so one arrive/wait pair covers them.
+        if const_expr(self.use_clc_scheduler):
+            clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
+
+            clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            num_clc_consumer_warps_per_cta = self.num_threads // cute.arch.WARP_SIZE
+            num_clc_consumer_warps = num_clc_consumer_warps_per_cta * self.cta_group_size
+            clc_pipeline_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, cute.arch.WARP_SIZE * num_clc_consumer_warps
+            )
+            clc_pipeline = pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=clc_mbar_ptr,
+                num_stages=self.sched_stages,
+                producer_group=clc_pipeline_producer_group,
+                consumer_group=clc_pipeline_consumer_group,
+                tx_count=16,
+                cta_layout_vmnk=cta_layout_vmnk,
+                defer_sync=True,
+            )
+
         pipeline.pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
 
         # ==== Get SMEM tensors ====
@@ -992,14 +1012,6 @@ class FlashAttentionMLAForwardSm100:
 
         if const_expr(self.use_clc_scheduler):
             clc_response_ptr = storage.clc_response.data_ptr()
-            clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
-
-            clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-            num_clc_consumer_warps_per_cta = self.num_threads // cute.arch.WARP_SIZE
-            num_clc_consumer_warps = num_clc_consumer_warps_per_cta * self.cta_group_size
-            clc_pipeline_consumer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, cute.arch.WARP_SIZE * num_clc_consumer_warps
-            )
             sched_ctx = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_scheduler_cls.clc_problem_shape(tile_sched_params),
@@ -1007,14 +1019,7 @@ class FlashAttentionMLAForwardSm100:
                     cute.arch.grid_dim(),
                     clc_response_ptr,
                 ),
-                pipeline=pipeline.PipelineClcFetchAsync.create(
-                    barrier_storage=clc_mbar_ptr,
-                    num_stages=self.sched_stages,
-                    producer_group=clc_pipeline_producer_group,
-                    consumer_group=clc_pipeline_consumer_group,
-                    tx_count=16,
-                    cta_layout_vmnk=cta_layout_vmnk,
-                ),
+                pipeline=clc_pipeline,
                 consumer_state=pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self.sched_stages
                 ),
