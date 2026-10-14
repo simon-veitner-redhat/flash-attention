@@ -348,3 +348,16 @@ def test_valid_length_broadcast_cache_reuse():
         for b in range(batch):
             ref, _ = ref_sparse_mla(q[b], qv[b], kv[b], idx[b], lengths[b].tolist())
             torch.testing.assert_close(out[b], ref, atol=0.015, rtol=0.015)
+
+
+def test_fp8_kv_outside_the_decode_kernel_raises():
+    """fp8 K/V with a 16-bit qv only runs on the sparse decode kernel: 128 heads must not misroute."""
+    device = "cuda"
+    kv, k, v = make_flat_kv(1024, device)
+    q, qv = make_q(4, device, num_heads=128)
+    idx, valid_len = make_indices([256] * 4, 1024, device, topk=256)
+    with pytest.raises(NotImplementedError, match="sparse MLA decode kernel"):
+        run_kernel(
+            q, qv, k.to(torch.float8_e4m3fn), v.to(torch.float8_e4m3fn),
+            cu_seqlens_from([1] * 4, device), 1024, idx, valid_len,
+        )

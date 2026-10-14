@@ -34,6 +34,7 @@ _RING = {8: (6, False), 16: (6, True), 32: (5, False)}
 class FlashAttentionMLADecodeSm100:
     # h is also the tcgen05 ld/st Repetition, a power-of-two enum: gate on membership, not h % 8
     SUPPORTED_HEADS = tuple(_RING)
+    SUPPORTED_KV_FORMATS = (None, "fp8_e4m3")
 
     def __init__(
         self,
@@ -41,6 +42,7 @@ class FlashAttentionMLADecodeSm100:
         qhead_per_kvhead: int = 16,
         num_splits: int = 1,
         num_head_groups: int = 1,
+        kv_format: Optional[str] = None,
     ):
         assert num_head_groups >= 1 and qhead_per_kvhead % num_head_groups == 0, (
             f"num_head_groups={num_head_groups} must divide qhead_per_kvhead={qhead_per_kvhead}"
@@ -51,6 +53,13 @@ class FlashAttentionMLADecodeSm100:
             f"got {h_group}"
         )
 
+        # None: 16-bit KV, the MMA dtype. "fp8_e4m3": per-tensor e4m3 rows (latent then rope,
+        # 576 B), converted exactly to 16 bit in-kernel. The scales are the caller's: q_scale *
+        # k_scale folds into softmax_scale, v_scale multiplies the output.
+        assert kv_format in self.SUPPORTED_KV_FORMATS, (
+            f"kv_format must be one of {self.SUPPORTED_KV_FORMATS}, got {kv_format}"
+        )
+        self.kv_format = kv_format
         self.topk_length = topk_length
         self.h = h_group
         self.num_head_groups = num_head_groups
@@ -189,6 +198,8 @@ class FlashAttentionMLADecodeSm100:
             "split-KV needs the partial LSE tensor: flash_fwd_combine reduces on it"
         )
 
+        if const_expr(self.kv_format is not None):
+            raise NotImplementedError("kv_format='fp8_e4m3': the fp8 gather is not implemented yet")
         dtype = mV.element_type
         assert dtype in (cutlass.Float16, cutlass.BFloat16), "sparse decode requires 16-bit KV"
         self.dtype_O = mO.element_type
