@@ -1185,6 +1185,43 @@ class FlashAttentionMLADecodeSm100:
         ps_st.advance()
         return cs_S, ps_P, ps_st
 
+    @cute.jit
+    def _epilogue_fp8_halves(self, mO, ab_dtype, accO, sInv, ctid, m_idx, head_base, split_idx):
+        """fp8_mma epilogue, h / 2 accumulator columns per TMEM load: O = O_hi + 2^-4 O_lo,
+        times this split's 1 / rowsum, to mO."""
+        h2 = self.h // 2
+        mma_h = sm100_utils.make_trivial_tiled_mma(
+            ab_dtype, OperandMajorMode.MN, OperandMajorMode.K, self.dtype_acc,
+            CtaGroup.ONE, (self.dv_chunk, h2),
+        )
+        thr_h = mma_h.get_slice(0)
+        lay_h = thr_h.make_fragment_C(thr_h.partition_shape_C((self.dv_chunk, h2))).layout
+        view = lambda j, k: cute.make_tensor(accO[j].iterator + k * h2, lay_h)[(None, None), 0, 0]
+        ld_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(h2)), Float32
+        )
+        thr_ld = tcgen05.make_tmem_copy(ld_atom, view(0, 0)).get_slice(ctid)
+        c_t2r = thr_ld.partition_D(
+            thr_h.partition_C(cute.make_identity_tensor((self.dv_chunk, h2)))[(None, None), 0, 0]
+        )
+        assert cute.size(c_t2r) == h2
+        rHi = cute.make_rmem_tensor(c_t2r.shape, Float32)
+        rLo = cute.make_rmem_tensor(c_t2r.shape, Float32)
+        # heads outer: only h / 2 heads' output addresses and 1 / rowsum values stay live
+        for k in cutlass.range_constexpr(2):
+            for j in cutlass.range_constexpr(self.num_chunks):
+                cute.copy(thr_ld, thr_ld.partition_S(view(2 * j, k)), rHi)
+                cute.copy(thr_ld, thr_ld.partition_S(view(2 * j + 1, k)), rLo)
+                cute.arch.fence_view_async_tmem_load()
+                for i in cutlass.range_constexpr(h2):
+                    dv = j * self.dv_chunk + c_t2r[i][0]
+                    hh = k * h2 + c_t2r[i][1]
+                    o = (rHi[i] + rLo[i] * (1.0 / FP8_P_LO_SCALE)) * sInv[hh]
+                    if const_expr(self.is_split_kv):
+                        mO[m_idx, dv, head_base + hh, split_idx] = o.to(self.dtype_O)
+                    else:
+                        mO[m_idx, dv, head_base + hh] = o.to(self.dtype_O)
+
     # =========================================== correction + Q^T load + epilogue
     def _qt_fp8_units(self):
         """e4m3 Q^T is K-major like q in gmem (each head's 576 dims contiguous): it is moved in
@@ -1349,7 +1386,11 @@ class FlashAttentionMLADecodeSm100:
         fa_sm100_utils.fence_tcgen05_after_thread_sync()
         if const_expr(self.fp8_mma):
             tOrO_lo = cute.make_rmem_tensor(cO_t2r.shape, Float32)
-        for j in cutlass.range_constexpr(self.num_chunks):
+        if const_expr(self.fp8_mma and h > 16):
+            # h = 32: O_hi + O_lo of all h columns plus the h hoisted 1/rowsum values exceed
+            # the 128-register budget (STL/LDL); read the accumulators h / 2 columns at a time
+            self._epilogue_fp8_halves(mO, mma_O.op.a_dtype, accO, sInv, ctid, m_idx, head_base, split_idx)
+        for j in cutlass.range_constexpr(0 if const_expr(self.fp8_mma and h > 16) else self.num_chunks):
             if const_expr(not self.fp8_mma):
                 cute.copy(thr_ldO, tOaccO_ld[j], tOrO)
                 cute.arch.fence_view_async_tmem_load()
