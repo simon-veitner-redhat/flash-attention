@@ -737,6 +737,9 @@ class FlashAttentionMLADecodeSm100:
             hh = head_base + e // self.hdimv
             dv = e % self.hdimv
             if const_expr(full) or i < slice_vecs:
+                # The same math as FlashAttentionForwardCombine, but the S terms are summed in
+                # a different order (serially, in split order), so at S >= 4 fused and unfused
+                # results can differ by 1 bf16 ulp in O and 1 fp32 ulp in the LSE.
                 lse_max = rL[0, k]
                 for s in cutlass.range_constexpr(1, S):
                     lse_max = cute.arch.fmax(lse_max, rL[s, k])
