@@ -36,7 +36,7 @@ _RING_FP8_STAGED = {8: (4, 3, False), 16: (4, 3, False), 32: (4, 2, True)}
 FP8_STG_CHUNK_BYTES = 128 * 128  # one 128-row x 128-col e4m3 latent chunk
 # fp8 KV with an e4m3 Q: kind::f8f6f4 MMAs straight on the gathered e4m3 stages (16 KB per
 # latent stage). h -> (latent ring depth, rope ring depth); P^T is never aliased.
-_RING_FP8_MMA = {8: (12, 2), 16: (12, 2), 32: (11, 2)}
+_RING_FP8_MMA = {8: (12, 2), 16: (12, 2), 32: (10, 2)}
 # The O^T MMA's B is [P_hi | P_lo]^T in e4m3, stacked along N (N = 2h):
 #   P_hi = e4m3(P * 2^8), P_lo = e4m3((P * 2^8 - P_hi) * 2^4),
 #   O = (O_hi + 2^-4 * O_lo) * 2^-8 / rowsum  (relative error ~2^-8, like a bf16 P).
@@ -83,6 +83,9 @@ class FlashAttentionMLADecodeSm100:
         self.fp8_p_split = fp8_p_split
         self.o_cols = None  # N of the O^T MMA: h, or 2h for the stacked [P_hi | P_lo]
         self.n_rope = 1
+        # S^T accumulators and P^T buffers: 2 for fp8_mma, so S^T(b + 1) and softmax(b + 1)
+        # overlap the correction and O^T of block b
+        self.n_sp = 1
         self.topk_length = topk_length
         self.h = h_group
         self.num_head_groups = num_head_groups
@@ -178,14 +181,14 @@ class FlashAttentionMLADecodeSm100:
         LqtC = sm100_utils.make_smem_layout_b(mma_S, (tn, h, dv), dtype, self.num_chunks)
         LqtR = sm100_utils.make_smem_layout_b(mma_S, (tn, h, self.hdim_rope), dtype, 1)
         # B of O^T, MN-major (heads contiguous). 8-bit MN-major B needs N % 16 == 0: N = 2h.
-        Lpt = sm100_utils.make_smem_layout_b(mma_O, (dv, no, tn), dtype, 1)
+        Lpt = sm100_utils.make_smem_layout_b(mma_O, (dv, no, tn), dtype, self.n_sp)
 
         assert cute.cosize(LlatK) == n_lat * tn * dv
         assert cute.cosize(LlatMN) == n_lat * tn * dv
         assert cute.cosize(Lrope) == self.n_rope * tn * self.hdim_rope
         assert cute.cosize(LqtC) == self.num_chunks * h * dv
         assert cute.cosize(LqtR) == h * self.hdim_rope
-        assert cute.cosize(Lpt) == tn * no
+        assert cute.cosize(Lpt) == self.n_sp * tn * no
         return mma_S, mma_O, LlatK, LlatMN, Lrope, LqtC, LqtR, Lpt
 
     def _get_shared_storage_cls(self, dtype, n_lat, alias_pt_on_rope, n_stg=0):
@@ -198,15 +201,15 @@ class FlashAttentionMLADecodeSm100:
         lat_elems = n_lat * tn * self.dv_chunk
         rope_elems = self.n_rope * tn * self.hdim_rope
         qt_elems = h * self.hdim_total
-        pt_elems = 0 if alias_pt_on_rope else tn * self.o_cols
+        pt_elems = 0 if alias_pt_on_rope else self.n_sp * tn * self.o_cols
 
         # 128B-align the fp32 arrays so racecheck does not report hazards across their boundary
         @cute.struct
         class SharedStorage:
             mbar_lat: cute.struct.MemRange[Int64, 2 * n_lat]
             mbar_rope: cute.struct.MemRange[Int64, 2 * self.n_rope]
-            mbar_S: cute.struct.MemRange[Int64, 2]
-            mbar_P: cute.struct.MemRange[Int64, 2]
+            mbar_S: cute.struct.MemRange[Int64, 2 * self.n_sp]
+            mbar_P: cute.struct.MemRange[Int64, 2 * self.n_sp]
             mbar_O: cute.struct.MemRange[Int64, 2]
             mbar_stats: cute.struct.MemRange[Int64, 2 * nst]
             mbar_Q: cute.struct.MemRange[Int64, 1]
@@ -299,7 +302,9 @@ class FlashAttentionMLADecodeSm100:
         self.o_cols = 2 * self.h if const_expr(self.fp8_mma) else self.h
         if const_expr(self.fp8_mma):
             # S^T at columns [0, h), O_j^T = [O_hi | O_lo] at [h + 2hj, h + 2h(j + 1))
-            self.tmem_off_O = [self.h + 2 * self.h * j for j in range(self.num_chunks)]
+            # S^T stages at [0, h) and [h, 2h); O_j^T = [O_hi | O_lo] at 2h + 2hj
+            self.n_sp = 2
+            self.tmem_off_O = [2 * self.h + 2 * self.h * j for j in range(self.num_chunks)]
             assert self.tmem_off_O[-1] + 2 * self.h <= self.tmem_alloc_cols
         if const_expr(self.fp8_staged):
             n_lat, n_stg, alias_pt = _RING_FP8_STAGED[self.h]
@@ -482,12 +487,12 @@ class FlashAttentionMLADecodeSm100:
         assert pl_rope.sync_object_full.arrive_count == lat_grp.size
 
         pl_S = pipeline.PipelineUmmaAsync.create(
-            barrier_storage=storage.mbar_S.data_ptr(), num_stages=1,
+            barrier_storage=storage.mbar_S.data_ptr(), num_stages=self.n_sp,
             producer_group=mma_grp, consumer_group=sm_grp,
             cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
         )
         pl_P = pipeline.PipelineAsyncUmma.create(
-            barrier_storage=storage.mbar_P.data_ptr(), num_stages=1,
+            barrier_storage=storage.mbar_P.data_ptr(), num_stages=self.n_sp,
             producer_group=sm_grp, consumer_group=mma_grp,
             cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
         )
@@ -880,6 +885,14 @@ class FlashAttentionMLADecodeSm100:
         # Q^T is filled by the correction warps with plain STS
         cute.arch.mbarrier_wait(mbar_Q, Int32(0))
 
+        if const_expr(self.fp8_mma):
+            self._mma_loop_pipelined(
+                mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
+                tSrLat, tSrRope, tSrQtC, tSrQtR, tOrLat, tOrPt,
+                pl_lat, pl_rope, pl_S, pl_P, pl_O, num_n_blocks,
+            )
+            return
+
         states = self._mma_block(
             mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
             tSrLat, tSrRope, tSrQtC, tSrQtR, tOrLat, tOrPt,
@@ -891,6 +904,108 @@ class FlashAttentionMLADecodeSm100:
                 tSrLat, tSrRope, tSrQtC, tSrQtR, tOrLat, tOrPt,
                 pl_lat, pl_rope, pl_S, pl_P, pl_O, states, False,
             )
+
+    @cute.jit
+    def _mma_loop_pipelined(
+        self, mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
+        tSrLat, tSrRope, tSrQtC, tSrQtR, tOrLat, tOrPt,
+        pl_lat, pl_rope, pl_S, pl_P, pl_O, num_n_blocks,
+    ):
+        """fp8_mma: S^T(b + 1) is issued before waiting for P^T(b), into the other S^T
+        accumulator, so the softmax of block b + 1 runs under the correction and O^T of b."""
+        Producer = pipeline.PipelineUserType.Producer
+        Consumer = pipeline.PipelineUserType.Consumer
+        cs_lat = pipeline.make_pipeline_state(Consumer, self.n_lat)  # S^T reads
+        use_lat = pipeline.make_pipeline_state(Consumer, self.n_lat)  # O^T reads
+        cs_rope = pipeline.make_pipeline_state(Consumer, self.n_rope)
+        cs_P = pipeline.make_pipeline_state(Consumer, self.n_sp)
+        ps_S = pipeline.make_pipeline_state(Producer, self.n_sp)
+        ps_O = pipeline.make_pipeline_state(Producer, 1)
+
+        cs_lat, cs_rope, ps_S = self._mma_S(
+            mma_S, sLatK, sRope, sQtC, sQtR, tSrLat, tSrRope, tSrQtC, tSrQtR,
+            pl_lat, pl_rope, pl_S, cs_lat, cs_rope, ps_S,
+        )
+        if num_n_blocks > 1:
+            cs_lat, cs_rope, ps_S = self._mma_S(
+                mma_S, sLatK, sRope, sQtC, sQtR, tSrLat, tSrRope, tSrQtC, tSrQtR,
+                pl_lat, pl_rope, pl_S, cs_lat, cs_rope, ps_S,
+            )
+        use_lat, cs_P, ps_O = self._mma_O(
+            mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O, True,
+        )
+        for b in cutlass.range(1, num_n_blocks, unroll=1):
+            if b + 1 < num_n_blocks:
+                cs_lat, cs_rope, ps_S = self._mma_S(
+                    mma_S, sLatK, sRope, sQtC, sQtR, tSrLat, tSrRope, tSrQtC, tSrQtR,
+                    pl_lat, pl_rope, pl_S, cs_lat, cs_rope, ps_S,
+                )
+            use_lat, cs_P, ps_O = self._mma_O(
+                mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O,
+                False,
+            )
+
+    @cute.jit
+    def _mma_S(
+        self, mma_S, sLatK, sRope, sQtC, sQtR, tSrLat, tSrRope, tSrQtC, tSrQtR,
+        pl_lat, pl_rope, pl_S, cs_lat, cs_rope, ps_S,
+    ):
+        """S^T stage ps_S = KV . Q^T over the 4 latent chunks + rope; frees the rope stage."""
+        pl_S.producer_acquire(ps_S)
+        acc = Int32(self.tmem_off_S) + ps_S.index * self.h
+        for c in cutlass.range_constexpr(self.num_chunks):
+            pl_lat.consumer_wait(cs_lat)
+            # orders this thread's generic-proxy view of the stage before its async-proxy MMA reads
+            cute.arch.fence_view_async_shared()
+            # stays in the loop: the c == 0 fence orders pl_S.producer_acquire before the first MMA
+            fa_sm100_utils.fence_tcgen05_after_thread_sync()
+            st = cs_lat.index
+            fa_sm100_utils.gemm_ptx_partial(
+                mma_S.op, acc,
+                tSrLat[None, None, None, st], tSrQtC[None, None, None, c],
+                sLatK[None, None, None, st], sQtC[None, None, None, c],
+                zero_init=const_expr(c == 0), cta_group=1,
+            )
+            cs_lat.advance()
+        pl_rope.consumer_wait(cs_rope)
+        cute.arch.fence_view_async_shared()
+        fa_sm100_utils.fence_tcgen05_after_thread_sync()
+        fa_sm100_utils.gemm_ptx_partial(
+            mma_S.op, acc,
+            tSrRope[None, None, None, cs_rope.index], tSrQtR[None, None, None, 0],
+            sRope[None, None, None, cs_rope.index], sQtR[None, None, None, 0],
+            zero_init=False, cta_group=1,
+        )
+        pl_S.producer_commit(ps_S)
+        ps_S.advance()
+        pl_rope.consumer_release(cs_rope)
+        cs_rope.advance()
+        return cs_lat, cs_rope, ps_S
+
+    @cute.jit
+    def _mma_O(
+        self, mma_O, sLatMN, sPt, tOrLat, tOrPt, pl_lat, pl_P, pl_O, use_lat, cs_P, ps_O,
+        is_first: cutlass.Constexpr[bool],
+    ):
+        """O^T += V^T . [P_hi | P_lo]^T for the oldest pending block; frees its latent stages."""
+        pl_P.consumer_wait(cs_P)
+        pl_O.producer_acquire(ps_O)
+        fa_sm100_utils.fence_tcgen05_after_thread_sync()
+        for c in cutlass.range_constexpr(self.num_chunks):
+            st = use_lat.index
+            fa_sm100_utils.gemm_ptx_partial(
+                mma_O.op, Int32(self.tmem_off_O[c]),
+                tOrLat[None, None, None, st], tOrPt[None, None, None, cs_P.index],
+                sLatMN[None, None, None, st], sPt[None, None, None, cs_P.index],
+                zero_init=const_expr(is_first), cta_group=1,
+            )
+            pl_lat.consumer_release(use_lat)
+            use_lat.advance()
+        pl_O.producer_commit(ps_O)
+        ps_O.advance()
+        pl_P.consumer_release(cs_P)
+        cs_P.advance()
+        return use_lat, cs_P, ps_O
 
     @cute.jit
     def _mma_block(
@@ -979,6 +1094,9 @@ class FlashAttentionMLADecodeSm100:
         cS_t2r = thr_ldS.partition_D(thr_mma_S.partition_C(cS)[(None, None), 0, 0])
         assert cute.size(cS_t2r) == h
         tSaccS = thr_ldS.partition_S(accS)
+        if const_expr(self.n_sp == 2):
+            # fp8_mma: the second S^T accumulator, h columns on
+            tSaccS = (tSaccS, thr_ldS.partition_S(cute.make_tensor(accS.iterator + h, accS.layout)))
         tSrS = cute.make_rmem_tensor(cS_t2r.shape, Float32)
         tSrP = cute.make_rmem_tensor(cS_t2r.shape, Float32)
         key_row = cS_t2r[0][0]
@@ -986,8 +1104,8 @@ class FlashAttentionMLADecodeSm100:
         pt_layout = cute.make_ordered_layout((self.o_cols, self.tile_n), order=(0, 1))
 
         states = (
-            pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1),
-            pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1),
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.n_sp),
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.n_sp),
             pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages_stats
             ),
@@ -1029,7 +1147,13 @@ class FlashAttentionMLADecodeSm100:
         # ---- read S^T out of TMEM and release the accumulator ---------------------
         pl_S.consumer_wait(cs_S)
         fa_sm100_utils.fence_tcgen05_after_thread_sync()
-        cute.copy(thr_ldS, tSaccS, tSrS)
+        if const_expr(self.n_sp == 1):
+            cute.copy(thr_ldS, tSaccS, tSrS)
+        else:
+            if cs_S.index == 0:
+                cute.copy(thr_ldS, tSaccS[0], tSrS)
+            else:
+                cute.copy(thr_ldS, tSaccS[1], tSrS)
         cute.arch.fence_view_async_tmem_load()
         fa_sm100_utils.fence_tcgen05_before_thread_sync()
         pl_S.consumer_release(cs_S)
