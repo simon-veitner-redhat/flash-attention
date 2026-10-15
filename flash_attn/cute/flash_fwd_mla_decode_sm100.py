@@ -726,9 +726,6 @@ class FlashAttentionMLADecodeSm100:
         cS_t2r = thr_ldS.partition_D(thr_mma_S.partition_C(cS)[(None, None), 0, 0])
         assert cute.size(cS_t2r) == h
         tSaccS = thr_ldS.partition_S(accS)
-        if const_expr(self.n_sp == 2):
-            # fp8_mma: the second S^T accumulator, h columns on
-            tSaccS = (tSaccS, thr_ldS.partition_S(cute.make_tensor(accS.iterator + h, accS.layout)))
         tSrS = cute.make_rmem_tensor(cS_t2r.shape, Float32)
         tSrP = cute.make_rmem_tensor(cS_t2r.shape, Float32)
         key_row = cS_t2r[0][0]
@@ -782,10 +779,12 @@ class FlashAttentionMLADecodeSm100:
         if const_expr(self.n_sp == 1):
             cute.copy(thr_ldS, tSaccS, tSrS)
         else:
-            if cs_S.index == 0:
-                cute.copy(thr_ldS, tSaccS[0], tSrS)
-            else:
-                cute.copy(thr_ldS, tSaccS[1], tSrS)
+            # fp8_mma: S^T stage cs_S sits h TMEM columns per stage on (branch-free select)
+            cute.copy(
+                thr_ldS,
+                cute.make_tensor(tSaccS.iterator + cs_S.index * self.h, tSaccS.layout),
+                tSrS,
+            )
         cute.arch.fence_view_async_tmem_load()
         fa_sm100_utils.fence_tcgen05_before_thread_sync()
         pl_S.consumer_release(cs_S)
