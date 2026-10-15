@@ -3975,6 +3975,13 @@ def flash_attn_varlen_func(
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
 
+    fp8 MLA (q, qv, k and v all float8_e4m3fn, SM100/SM110 sparse decode only): the MMAs run
+        as tcgen05 kind::f8f6f4 directly on the e4m3 inputs, with P^T as two e4m3 terms
+        (hi + 2^-4 lo), so O matches a 16-bit kernel on the upcast inputs to about 2^-8
+        relative, unlike the bit-exact 16-bit path; the LSE matches to fp32 rounding. No
+        descales are taken: fold q_scale * k_scale into softmax_scale and multiply the
+        output (bf16) by v_scale.
+
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
 
