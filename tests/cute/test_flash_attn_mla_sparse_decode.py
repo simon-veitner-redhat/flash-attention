@@ -401,3 +401,61 @@ def test_decode_batch_lookup_per_request_kv(q_lens, fp8):
     out_ref, lse_ref = flat_kv.ref_sparse_mla(q, qv, kv, ref_idx, counts)
     out_pt, _ = flat_kv.ref_sparse_mla(q, qv, kv, ref_idx, counts, upcast=False)
     flat_kv.assert_close(out, lse, out_ref, lse_ref, out_pt, counts)
+
+
+@pytest.mark.parametrize("num_heads,total_q", [(32, 8), (32, 48), (16, 8)])
+def test_decode_fp8_fused_combine_graph_capture(num_heads, total_q):
+    """fp8 split-KV grids with the fused combine and short ragged valid lengths, in a CUDA
+    graph: captured before any eager call (falls back to the separate combine kernel) and
+    after one (fused, ticket buffer sized), each replayed twice against the bf16 upcast."""
+    import flash_attn.cute.interface as interface
+
+    device = "cuda"
+    kv8, _, _ = fp8_flat_kv(NUM_KV_ROWS, device, seed=80)
+    q, qv = flat_kv.make_q(total_q, device, dtype=torch.float8_e4m3fn, seed=81, num_heads=num_heads)
+    counts = ([600, 1, 129, 0, 1024, 257, 2048, 384] * total_q)[:total_q]
+    idx, valid_len = flat_kv.make_indices(counts, NUM_KV_ROWS, device, seed=82)
+    cu_q = flat_kv.cu_seqlens_from([1] * total_q, device)
+    zeros = torch.zeros(total_q + 1, device=device, dtype=torch.int32)
+    used = torch.full((total_q,), NUM_KV_ROWS, device=device, dtype=torch.int32)
+    splits = mla_decode_splits(total_q, 1, num_heads, 148, TOPK // TILE_N, fp8_kv=True)[1]
+    assert splits > 1
+
+    def call():
+        out, lse, *_ = interface._flash_attn_fwd(
+            q, kv8[..., 512:], kv8[..., :512], qv=qv,
+            cu_seqlens_q=cu_q, cu_seqlens_k=zeros, seqused_k=used,
+            max_seqlen_q=1, max_seqlen_k=NUM_KV_ROWS,
+            gather_kv_indices=idx, gather_kv_valid_length=valid_len,
+            softmax_scale=SOFTMAX_SCALE, causal=False, return_lse=True,
+            sparse_decode_fused_combine=True,
+        )
+        return out, (lse if lse.shape[0] == total_q else lse.t())
+
+    kv16 = kv8.to(torch.bfloat16)
+    out16, lse16 = run_decode(
+        q.to(torch.bfloat16), qv.to(torch.bfloat16), kv16[..., 512:], kv16[..., :512], cu_q, idx,
+        valid_len,
+    )
+    saved = dict(interface._FUSED_COMBINE_SEMAPHORES)
+    interface._FUSED_COMBINE_SEMAPHORES.clear()
+    try:
+        for warm in (False, True):
+            if warm:
+                assert_fp8_q_close(*call(), out16, lse16, counts)
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+                out, lse = call()
+            torch.cuda.current_stream().wait_stream(s)
+            for _ in range(2):
+                out.zero_()
+                g.replay()
+                torch.cuda.synchronize()
+                assert_fp8_q_close(out, lse, out16, lse16, counts)
+            ready = interface._fused_combine_semaphores_ready(q.device, splits, total_q)
+            assert ready == warm
+    finally:
+        interface._FUSED_COMBINE_SEMAPHORES.clear()
+        interface._FUSED_COMBINE_SEMAPHORES.update(saved)

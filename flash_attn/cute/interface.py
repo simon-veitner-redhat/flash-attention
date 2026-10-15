@@ -354,8 +354,8 @@ def _fused_combine_semaphores(device, num_splits, num_groups):
     The kernel never resets them: every launch adds exactly S to each group's ticket counter,
     so one buffer serves any number of stream-ordered launches with the same S (one buffer per
     (device, S)). Two fused split launches with the same S must not run concurrently on
-    different streams. The buffer grows outside CUDA-graph capture only; a captured launch
-    must fit what an eager warmup call allocated.
+    different streams. The buffer grows outside CUDA-graph capture only; a launch captured
+    before an eager call sized it falls back to the separate combine kernel.
     """
     key = (device.index, num_splits)
     buf = _FUSED_COMBINE_SEMAPHORES.get(key)
@@ -371,6 +371,11 @@ def _fused_combine_semaphores(device, num_splits, num_groups):
         buf = torch.zeros(rows, num_splits + 1, dtype=torch.int64, device=device)
         _FUSED_COMBINE_SEMAPHORES[key] = buf
     return buf
+
+
+def _fused_combine_semaphores_ready(device, num_splits, num_groups):
+    buf = _FUSED_COMBINE_SEMAPHORES.get((device.index, num_splits))
+    return buf is not None and buf.shape[0] >= num_groups
 
 
 def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks, fp8_kv=False):
@@ -1101,6 +1106,17 @@ def _flash_attn_fwd(
     # sparse decode only, internal opt-in: reduce the KV splits inside the decode kernel
     # (no FlashAttentionForwardCombine launch); see FlashAttentionMLADecodeSm100._fused_combine
     fused_combine = bool(sparse_decode_fused_combine) and use_sparse_decode and is_split_kv
+    if (
+        fused_combine
+        and not isinstance(q, _CompileOnlyTensorSpec)
+        and torch.cuda.is_current_stream_capturing()
+        and not _fused_combine_semaphores_ready(
+            device, num_splits, total_q * num_head_kv * decode_splits[0]
+        )
+    ):
+        # no eager call sized the ticket buffer before this capture: capture the separate
+        # combine kernel rather than allocate inside the graph
+        fused_combine = False
     if is_split_kv:
         # flash_fwd_combine wants the query dim contiguous in the partial LSE; qv has it first
         lse_partial_shape = (
