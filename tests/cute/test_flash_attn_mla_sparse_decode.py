@@ -403,11 +403,12 @@ def test_decode_batch_lookup_per_request_kv(q_lens, fp8):
     flat_kv.assert_close(out, lse, out_ref, lse_ref, out_pt, counts)
 
 
-@pytest.mark.parametrize("num_heads,total_q", [(32, 8), (32, 48), (16, 8)])
+@pytest.mark.parametrize("num_heads,total_q", [(32, 8), (32, 16), (16, 8)])
 def test_decode_fp8_fused_combine_graph_capture(num_heads, total_q):
-    """fp8 split-KV grids with the fused combine and short ragged valid lengths, in a CUDA
-    graph: captured before any eager call (falls back to the separate combine kernel) and
-    after one (fused, ticket buffer sized), each replayed twice against the bf16 upcast."""
+    """fp8 split-KV grids (h32 b8 / b16, h16 b8) with the fused combine and short ragged valid
+    lengths, in a CUDA graph: captured before any eager call (falls back to the separate combine
+    kernel) and after one (fused, ticket buffer sized), each replayed twice against the bf16
+    upcast."""
     import flash_attn.cute.interface as interface
 
     device = "cuda"

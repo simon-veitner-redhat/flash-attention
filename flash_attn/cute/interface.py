@@ -387,7 +387,10 @@ def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_block
     valid blocks, and never spend an extra wave on splitting.
 
     fp8_kv: the e4m3 kernel splits the valid window evenly at run time (every split sees valid
-    blocks whatever the valid length), so its > 16-head grids may split two ways.
+    blocks whatever the valid length), so its > 16-head grids may split two ways. Under DCP its
+    top-k rows are few and dense in the request's own pages, so head-group CTAs share them
+    through L2: > 16-head fp8 grids take head groups (down to 8 heads) up to the SMs before
+    any KV split (TP4 DCP2 captures, h32 T32-T64: 11.4-13.1 vs 13.6-16.7 us split first).
     """
     supported = FlashAttentionMLADecodeSm100.SUPPORTED_HEADS
     waves = lambda groups, splits: -(-total_q * nheads_kv * groups * splits // num_SMs)
@@ -395,6 +398,18 @@ def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_block
     min_splits, extra_waves = (qhead_per_kvhead // 8, 0) if qhead_per_kvhead > 16 else (2, 1)
     if fp8_kv:
         min_splits = 2
+
+    def grow_head_groups(groups, min_heads, splits):
+        while (
+            qhead_per_kvhead // (2 * groups) in supported
+            and qhead_per_kvhead // (2 * groups) >= min_heads
+            and waves(2 * groups, splits) == waves(groups, splits)
+        ):
+            groups *= 2
+        return groups
+
+    if fp8_kv and qhead_per_kvhead > 16:
+        head_groups = grow_head_groups(head_groups, 8, 1)
     # Fewest waves per split, with at least two blocks per split.
     candidates = [1] + [
         s
@@ -405,22 +420,13 @@ def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_block
     ]
     splits = min(candidates, key=lambda s: waves(head_groups, s) / s)
 
-    def grow_head_groups(groups, min_heads):
-        while (
-            qhead_per_kvhead // (2 * groups) in supported
-            and qhead_per_kvhead // (2 * groups) >= min_heads
-            and waves(2 * groups, splits) == waves(groups, splits)
-        ):
-            groups *= 2
-        return groups
-
     # Fill the last wave: head groups down to 16 heads, then one block per split, then 8 heads.
-    head_groups = grow_head_groups(head_groups, 16)
+    head_groups = grow_head_groups(head_groups, 16, splits)
     if 2 * splits == num_n_blocks and (
         waves(head_groups, num_n_blocks) == waves(head_groups, splits)
     ):
         splits = num_n_blocks
-    head_groups = grow_head_groups(head_groups, 8)
+    head_groups = grow_head_groups(head_groups, 8, splits)
     return head_groups, splits
 
 
