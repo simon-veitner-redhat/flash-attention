@@ -257,14 +257,17 @@ def fp8_flat_kv(num_rows, device, seed, poison_rows=4):
 @pytest.mark.parametrize(
     "num_heads,dtype",
     [(8, torch.bfloat16), (16, torch.bfloat16), (32, torch.bfloat16), (64, torch.bfloat16),
-     (16, torch.float16), (8, torch.float8_e4m3fn), (32, torch.float8_e4m3fn)],
+     (16, torch.float16), (8, torch.float8_e4m3fn), (16, torch.float8_e4m3fn),
+     (32, torch.float8_e4m3fn), (64, torch.float8_e4m3fn)],
 )
-def test_decode_fp8_kv_bitwise_vs_upcast_cache(num_heads, dtype, total_q):
-    """e4m3 K/V (and an e4m3 Q) convert exactly in-kernel: O and LSE match the 16-bit kernel on
-    the upcast inputs bit for bit, including ragged/empty rows and -1 sentinels next to NaN
-    bytes. An e4m3 Q computes, and returns, in bf16."""
+def test_decode_fp8_kv_vs_upcast_cache(num_heads, dtype, total_q):
+    """fp8 e4m3 K/V against the 16-bit kernel on the upcast inputs, with ragged/empty rows and
+    -1 sentinels next to NaN bytes. A 16-bit Q widens K/V exactly: O and LSE match bit for bit.
+    An e4m3 Q runs kind::f8f6f4 MMAs with P^T as e4m3 hi + lo terms: LSE (fp32 scores of the
+    same e4m3 products) matches to rounding, O to the P quantization residual (~2^-8)."""
     device = "cuda"
-    dtype16 = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    fp8_q = dtype == torch.float8_e4m3fn
+    dtype16 = torch.bfloat16 if fp8_q else dtype
     counts = ragged_counts(total_q)
     kv8, k8, v8 = fp8_flat_kv(NUM_KV_ROWS, device, seed=60 + total_q)
     kv16 = kv8.to(dtype16)
@@ -278,5 +281,14 @@ def test_decode_fp8_kv_bitwise_vs_upcast_cache(num_heads, dtype, total_q):
         valid_len,
     )
     assert out8.dtype == dtype16
-    assert torch.equal(out8, out16), "fp8 output differs from the 16-bit kernel on the upcast cache"
-    assert torch.equal(lse8, lse16), "fp8 LSE differs from the 16-bit kernel on the upcast cache"
+    if not fp8_q:
+        assert torch.equal(out8, out16), "fp8 KV output differs from the 16-bit kernel"
+        assert torch.equal(lse8, lse16), "fp8 KV LSE differs from the 16-bit kernel"
+        return
+    assert torch.isfinite(out8).all(), "NaN/inf in the fp8-MMA output"
+    empty = torch.tensor([n == 0 for n in counts], device=device)
+    assert (out8[empty] == 0).all() and (lse8[empty] == -math.inf).all()
+    rel = ((out8.float() - out16.float()).norm() / out16.float().norm()).item()
+    assert rel < 4e-3, f"fp8-MMA output relL2 {rel:.2e} vs the 16-bit kernel"
+    lse_err = (lse8[~empty] - lse16[~empty]).abs().max().item()
+    assert lse_err < 1e-4, f"fp8-MMA LSE max diff {lse_err:.2e}"

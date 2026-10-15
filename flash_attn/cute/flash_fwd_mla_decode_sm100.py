@@ -34,6 +34,14 @@ _RING = {8: (6, False), 16: (6, True), 32: (5, False)}
 # on the rope stage). A tile's 4 latent chunks and its rope pass through the slots in order.
 _RING_FP8_STAGED = {8: (4, 3, False), 16: (4, 3, False), 32: (4, 2, True)}
 FP8_STG_CHUNK_BYTES = 128 * 128  # one 128-row x 128-col e4m3 latent chunk
+# fp8 KV with an e4m3 Q: kind::f8f6f4 MMAs straight on the gathered e4m3 stages (16 KB per
+# latent stage). h -> (latent ring depth, rope ring depth); P^T is never aliased.
+_RING_FP8_MMA = {8: (12, 2), 16: (12, 2), 32: (11, 2)}
+# The O^T MMA's B is [P_hi | P_lo]^T in e4m3, stacked along N (N = 2h):
+#   P_hi = e4m3(P * 2^8), P_lo = e4m3((P * 2^8 - P_hi) * 2^4),
+#   O = (O_hi + 2^-4 * O_lo) * 2^-8 / rowsum  (relative error ~2^-8, like a bf16 P).
+FP8_P_SCALE = 256.0
+FP8_P_LO_SCALE = 16.0
 
 
 class FlashAttentionMLADecodeSm100:
@@ -48,6 +56,7 @@ class FlashAttentionMLADecodeSm100:
         num_splits: int = 1,
         num_head_groups: int = 1,
         kv_format: Optional[str] = None,
+        fp8_p_split: bool = True,
     ):
         assert num_head_groups >= 1 and qhead_per_kvhead % num_head_groups == 0, (
             f"num_head_groups={num_head_groups} must divide qhead_per_kvhead={qhead_per_kvhead}"
@@ -65,7 +74,15 @@ class FlashAttentionMLADecodeSm100:
             f"kv_format must be one of {self.SUPPORTED_KV_FORMATS}, got {kv_format}"
         )
         self.kv_format = kv_format
-        self.fp8_staged = kv_format is not None  # the fp8 gather stages raw e4m3 in smem
+        # fp8 KV: with an e4m3 Q the MMAs run in kind::f8f6f4 on the gathered stages
+        # (fp8_mma); with a 16-bit Q the raw e4m3 is staged and converted (fp8_staged).
+        # Both are decided from Q's dtype in __call__.
+        self.fp8_mma = False
+        self.fp8_staged = False
+        # fp8_mma only: also run the P residual term (False = single-term e4m3 P, for tests)
+        self.fp8_p_split = fp8_p_split
+        self.o_cols = None  # N of the O^T MMA: h, or 2h for the stacked [P_hi | P_lo]
+        self.n_rope = 1
         self.topk_length = topk_length
         self.h = h_group
         self.num_head_groups = num_head_groups
@@ -136,37 +153,39 @@ class FlashAttentionMLADecodeSm100:
         assert q_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN), (
             "fp8 KV needs a 16-bit or e4m3 Q"
         )
-        return cutlass.BFloat16 if q_dtype == cutlass.Float8E4M3FN else q_dtype
+        return q_dtype
 
     # ------------------------------------------------------------------ traced setup
     @cute.jit
     def _make_mmas_and_layouts(self, dtype, n_lat):
         # must run inside a traced region; results passed to the kernel explicitly, never via self
         h, tn, dv = self.h, self.tile_n, self.dv_chunk
+        no = self.o_cols
         mma_S = sm100_utils.make_trivial_tiled_mma(
             dtype, OperandMajorMode.K, OperandMajorMode.K, self.dtype_acc,
             CtaGroup.ONE, (tn, h),
         )
         mma_O = sm100_utils.make_trivial_tiled_mma(
             dtype, OperandMajorMode.MN, OperandMajorMode.MN, self.dtype_acc,
-            CtaGroup.ONE, (dv, h),
+            CtaGroup.ONE, (dv, no),
         )
-        # A of S^T (K-major) and A of O^T (MN-major) over the SAME bytes.
+        # A of S^T (K-major) and A of O^T (MN-major) over the SAME bytes. For e4m3 both are
+        # 128 B SW128 rows per token (16 B swizzle atomicity: legal for an 8-bit MN-major A).
         LlatK = sm100_utils.make_smem_layout_a(mma_S, (tn, h, dv), dtype, n_lat)
-        LlatMN = sm100_utils.make_smem_layout_a(mma_O, (dv, h, tn), dtype, n_lat)
-        Lrope = sm100_utils.make_smem_layout_a(mma_S, (tn, h, self.hdim_rope), dtype, 1)
+        LlatMN = sm100_utils.make_smem_layout_a(mma_O, (dv, no, tn), dtype, n_lat)
+        Lrope = sm100_utils.make_smem_layout_a(mma_S, (tn, h, self.hdim_rope), dtype, self.n_rope)
         # B of S^T: four 128-dim Q^T chunks + one 64-dim rope Q^T.
         LqtC = sm100_utils.make_smem_layout_b(mma_S, (tn, h, dv), dtype, self.num_chunks)
         LqtR = sm100_utils.make_smem_layout_b(mma_S, (tn, h, self.hdim_rope), dtype, 1)
-        # B of O^T, MN-major (heads contiguous).
-        Lpt = sm100_utils.make_smem_layout_b(mma_O, (dv, h, tn), dtype, 1)
+        # B of O^T, MN-major (heads contiguous). 8-bit MN-major B needs N % 16 == 0: N = 2h.
+        Lpt = sm100_utils.make_smem_layout_b(mma_O, (dv, no, tn), dtype, 1)
 
         assert cute.cosize(LlatK) == n_lat * tn * dv
         assert cute.cosize(LlatMN) == n_lat * tn * dv
-        assert cute.cosize(Lrope) == tn * self.hdim_rope
+        assert cute.cosize(Lrope) == self.n_rope * tn * self.hdim_rope
         assert cute.cosize(LqtC) == self.num_chunks * h * dv
         assert cute.cosize(LqtR) == h * self.hdim_rope
-        assert cute.cosize(Lpt) == tn * h
+        assert cute.cosize(Lpt) == tn * no
         return mma_S, mma_O, LlatK, LlatMN, Lrope, LqtC, LqtR, Lpt
 
     def _get_shared_storage_cls(self, dtype, n_lat, alias_pt_on_rope, n_stg=0):
@@ -177,15 +196,15 @@ class FlashAttentionMLADecodeSm100:
         nst = self.num_stages_stats
 
         lat_elems = n_lat * tn * self.dv_chunk
-        rope_elems = tn * self.hdim_rope
+        rope_elems = self.n_rope * tn * self.hdim_rope
         qt_elems = h * self.hdim_total
-        pt_elems = 0 if alias_pt_on_rope else tn * h
+        pt_elems = 0 if alias_pt_on_rope else tn * self.o_cols
 
         # 128B-align the fp32 arrays so racecheck does not report hazards across their boundary
         @cute.struct
         class SharedStorage:
             mbar_lat: cute.struct.MemRange[Int64, 2 * n_lat]
-            mbar_rope: cute.struct.MemRange[Int64, 2]
+            mbar_rope: cute.struct.MemRange[Int64, 2 * self.n_rope]
             mbar_S: cute.struct.MemRange[Int64, 2]
             mbar_P: cute.struct.MemRange[Int64, 2]
             mbar_O: cute.struct.MemRange[Int64, 2]
@@ -239,6 +258,8 @@ class FlashAttentionMLADecodeSm100:
             # the MMA, smem and P^T dtype: a 16-bit Q's, or bf16 for an e4m3 Q (exact widening);
             # only the Q^T fill and the gather read fp8
             dtype = self._mma_dtype_fp8_kv(mQv)
+            self.fp8_mma = dtype == cutlass.Float8E4M3FN
+            self.fp8_staged = not self.fp8_mma
             assert mQ.element_type == mQv.element_type, "q and qv must share a dtype"
             assert mK.element_type == mV.element_type == cutlass.Float8E4M3FN, (
                 "kv_format='fp8_e4m3' needs e4m3 K and V"
@@ -274,8 +295,15 @@ class FlashAttentionMLADecodeSm100:
             mIndexTopk.iterator, cute.select(mIndexTopk.layout, mode=[1, 0])
         )
 
+        self.o_cols = 2 * self.h if const_expr(self.fp8_mma) else self.h
+        if const_expr(self.fp8_mma):
+            # S^T at columns [0, h), O_j^T = [O_hi | O_lo] at [h + 2hj, h + 2h(j + 1))
+            self.tmem_off_O = [self.h + 2 * self.h * j for j in range(self.num_chunks)]
+            assert self.tmem_off_O[-1] + 2 * self.h <= self.tmem_alloc_cols
         if const_expr(self.fp8_staged):
             n_lat, n_stg, alias_pt = _RING_FP8_STAGED[self.h]
+        elif const_expr(self.fp8_mma):
+            (n_lat, self.n_rope), n_stg, alias_pt = _RING_FP8_MMA[self.h], 0, False
         else:
             (n_lat, alias_pt), n_stg = _RING[self.h], 0
         self.n_stg = n_stg
@@ -306,7 +334,7 @@ class FlashAttentionMLADecodeSm100:
             smem=smem_bytes,
             stream=stream,
             # .minnctapersm 1 gives ptxas the entry register count that setmaxnreg needs
-            **({} if const_expr(self.kv_format is None) else {"min_blocks_per_mp": 1}),
+            **({"min_blocks_per_mp": 1} if const_expr(self.fp8_staged) else {}),
         )
 
     # ------------------------------------------------------------------ kernel
@@ -445,7 +473,7 @@ class FlashAttentionMLADecodeSm100:
             cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
         )
         pl_rope = pipeline.PipelineAsyncUmma.create(
-            barrier_storage=storage.mbar_rope.data_ptr(), num_stages=1,
+            barrier_storage=storage.mbar_rope.data_ptr(), num_stages=self.n_rope,
             producer_group=lat_grp, consumer_group=mma_grp,
             cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
         )
@@ -500,10 +528,27 @@ class FlashAttentionMLADecodeSm100:
         accO_fake = thr_mma_O.make_fragment_C(thr_mma_O.partition_shape_C((self.dv_chunk, h)))
 
         accS = cute.make_tensor(tmem_ptr + self.tmem_off_S, accS_fake.layout)[(None, None), 0, 0]
-        accO = [
-            cute.make_tensor(tmem_ptr + self.tmem_off_O[j], accO_fake.layout)[(None, None), 0, 0]
-            for j in range(self.num_chunks)
-        ]
+        mma_O_acc = mma_O
+        if const_expr(self.fp8_mma):
+            # h-wide views of the [O_hi | O_lo] accumulators: hi j at 2j, lo j at 2j + 1
+            # (layout only: an N = h MMA; B K-major so h = 8 is a legal 8-bit shape)
+            mma_O_acc = sm100_utils.make_trivial_tiled_mma(
+                dtype, OperandMajorMode.MN, OperandMajorMode.K, self.dtype_acc,
+                CtaGroup.ONE, (self.dv_chunk, h),
+            )
+            thr_acc = mma_O_acc.get_slice(0)
+            accO_fake = thr_acc.make_fragment_C(thr_acc.partition_shape_C((self.dv_chunk, h)))
+            accO = [
+                cute.make_tensor(
+                    tmem_ptr + self.tmem_off_O[j // 2] + h * (j % 2), accO_fake.layout
+                )[(None, None), 0, 0]
+                for j in range(2 * self.num_chunks)
+            ]
+        else:
+            accO = [
+                cute.make_tensor(tmem_ptr + self.tmem_off_O[j], accO_fake.layout)[(None, None), 0, 0]
+                for j in range(self.num_chunks)
+            ]
 
         # ==== role dispatch =========================================================
         if warp_idx < self.corr_warp_lo:
@@ -514,12 +559,14 @@ class FlashAttentionMLADecodeSm100:
             )
         elif warp_idx < self.mma_warp_id:
             self.corr_epilogue_loop(
-                mQ, mQv, mO, mLSE, mma_O, accO, sQtC, sQtR,
+                mQ, mQv, mO, mLSE, mma_O_acc, accO, sQtC, sQtR,
                 sScale, sSmMax, sSmSum, sInv, pl_O, pl_stats, mbar_Q,
                 tidx, head_kv, m_idx, hg_idx, split_idx,
                 softmax_scale_log2, num_n_blocks,
             )
-        elif const_expr(self.kv_format is None):
+        elif const_expr(not self.fp8_staged):
+            # 16-bit KV, and fp8 KV with kind::f8f6f4 MMAs: the cp.async gather fills the
+            # MMA's stages directly
             if warp_idx == self.mma_warp_id:
                 self.mma_loop(
                     mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
@@ -585,7 +632,7 @@ class FlashAttentionMLADecodeSm100:
         mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=2)[None, None, head_kv]
 
         ps_lat = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.n_lat)
-        ps_rope = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+        ps_rope = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.n_rope)
 
         for n_block in cutlass.range(num_n_blocks, unroll=1):
             mgr.load_index_topk(n_block_lo + n_block, transpose=False)
@@ -821,7 +868,7 @@ class FlashAttentionMLADecodeSm100:
         states = (
             pipeline.make_pipeline_state(Consumer, self.n_lat),  # cs_lat: S^T reads
             pipeline.make_pipeline_state(Consumer, self.n_lat),  # use_lat: O^T reads
-            pipeline.make_pipeline_state(Consumer, 1),           # cs_rope
+            pipeline.make_pipeline_state(Consumer, self.n_rope),  # cs_rope
             pipeline.make_pipeline_state(Consumer, 1),           # cs_P
             pipeline.make_pipeline_state(Producer, 1),
             pipeline.make_pipeline_state(Producer, 1),
@@ -878,6 +925,10 @@ class FlashAttentionMLADecodeSm100:
         )
         pl_S.producer_commit(ps_S)
         ps_S.advance()
+        if const_expr(self.fp8_mma):
+            # nothing aliases the rope stage: free it as soon as the S^T MMAs have read it
+            pl_rope.consumer_release(cs_rope)
+            cs_rope.advance()
 
         # ---- O^T += V^T . P^T, one MMA per dv chunk, A aliased on the latent ring --
         pl_P.consumer_wait(cs_P)
@@ -898,8 +949,9 @@ class FlashAttentionMLADecodeSm100:
         ps_O.advance()
 
         # released late: P^T may alias the rope stage, so the next gather must not overwrite it
-        pl_rope.consumer_release(cs_rope)
-        cs_rope.advance()
+        if const_expr(not self.fp8_mma):
+            pl_rope.consumer_release(cs_rope)
+            cs_rope.advance()
         pl_P.consumer_release(cs_P)
         cs_P.advance()
         return cs_lat, use_lat, cs_rope, cs_P, ps_S, ps_O
@@ -928,7 +980,7 @@ class FlashAttentionMLADecodeSm100:
         tSrP = cute.make_rmem_tensor(cS_t2r.shape, Float32)
         key_row = cS_t2r[0][0]
 
-        pt_layout = cute.make_ordered_layout((h, self.tile_n), order=(0, 1))
+        pt_layout = cute.make_ordered_layout((self.o_cols, self.tile_n), order=(0, 1))
 
         states = (
             pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1),
@@ -1030,8 +1082,28 @@ class FlashAttentionMLADecodeSm100:
         # ---- P^T staging: this thread's key, all h heads, MN-major ---------------
         pl_P.producer_acquire(ps_P)
         pt_nd = cute.composition(sPt[None, None, None, ps_P.index], pt_layout)
-        for i in cutlass.range_constexpr(h):
-            pt_nd[cS_t2r[i][1], key_row] = tSrP[i].to(sPt.element_type)
+        if const_expr(not self.fp8_mma):
+            for i in cutlass.range_constexpr(h):
+                pt_nd[cS_t2r[i][1], key_row] = tSrP[i].to(sPt.element_type)
+        else:
+            # this key's row of [P_hi | P_lo]^T: 2h contiguous e4m3 (heads, then heads)
+            rX = cute.make_rmem_tensor((h,), Float32)
+            for i in cutlass.range_constexpr(h):
+                rX[i] = tSrP[i] * FP8_P_SCALE
+            rHi = cute.make_rmem_tensor((h,), cutlass.Float8E4M3FN)
+            rHi.store(rX.load().to(cutlass.Float8E4M3FN))
+            rRow = cute.make_rmem_tensor((2 * h,), cutlass.Float8E4M3FN)
+            rLo = cute.make_rmem_tensor((h,), cutlass.Float8E4M3FN)
+            if const_expr(self.fp8_p_split):
+                rLo.store(((rX.load() - rHi.load().to(Float32)) * FP8_P_LO_SCALE).to(
+                    cutlass.Float8E4M3FN
+                ))
+            else:
+                rLo.fill(0.0)
+            for i in cutlass.range_constexpr(h):
+                rRow[cS_t2r[i][1]] = rHi[i]
+                rRow[h + cS_t2r[i][1]] = rLo[i]
+            cute.autovec_copy(rRow, pt_nd[None, key_row])
         cute.arch.fence_proxy("async.shared", space="cta")
         pl_P.producer_commit(ps_P)
         ps_P.advance()
@@ -1072,33 +1144,14 @@ class FlashAttentionMLADecodeSm100:
         qtr_layout = cute.make_ordered_layout((h, self.hdim_rope), order=(0, 1))
         gQv = mQv[m_idx, None, None]  # (512, h_total)
         gQr = mQ[m_idx, None, None]  # (64,  h_total)
-        if const_expr(mQv.element_type == sQtC.element_type):
-            for c in cutlass.range_constexpr(self.num_chunks):
-                qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
-                for n in cutlass.range_constexpr(h):
-                    qt_nd[n, ctid] = gQv[c * self.dv_chunk + ctid, head_base + n]
-            qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
-            if ctid < self.hdim_rope:
-                for n in cutlass.range_constexpr(h):
-                    qt_rope[n, ctid] = gQr[ctid, head_base + n]
-        else:
-            # fp8 e4m3 Q (fp8 KV only): widen exactly to the 16-bit MMA dtype on the way in
-            rQ8 = cute.make_rmem_tensor((h,), mQv.element_type)
-            rQ16 = cute.make_rmem_tensor((h,), sQtC.element_type)
-            for c in cutlass.range_constexpr(self.num_chunks):
-                qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
-                for n in cutlass.range_constexpr(h):
-                    rQ8[n] = gQv[c * self.dv_chunk + ctid, head_base + n]
-                rQ16.store(rQ8.load().to(sQtC.element_type))
-                for n in cutlass.range_constexpr(h):
-                    qt_nd[n, ctid] = rQ16[n]
-            qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
-            if ctid < self.hdim_rope:
-                for n in cutlass.range_constexpr(h):
-                    rQ8[n] = gQr[ctid, head_base + n]
-                rQ16.store(rQ8.load().to(sQtC.element_type))
-                for n in cutlass.range_constexpr(h):
-                    qt_rope[n, ctid] = rQ16[n]
+        for c in cutlass.range_constexpr(self.num_chunks):
+            qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
+            for n in cutlass.range_constexpr(h):
+                qt_nd[n, ctid] = gQv[c * self.dv_chunk + ctid, head_base + n]
+        qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
+        if ctid < self.hdim_rope:
+            for n in cutlass.range_constexpr(h):
+                qt_rope[n, ctid] = gQr[ctid, head_base + n]
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.mbarrier_arrive(mbar_Q)
 
@@ -1116,8 +1169,9 @@ class FlashAttentionMLADecodeSm100:
         cO_t2r = thr_ldO.partition_D(thr_mma_O.partition_C(cO)[(None, None), 0, 0])
         assert cute.size(cO_t2r) == h
         tOrO = cute.make_rmem_tensor(cO_t2r.shape, Float32)
-        tOaccO_ld = [thr_ldO.partition_S(accO[j]) for j in range(self.num_chunks)]
-        tOaccO_st = [thr_stO.partition_D(accO[j]) for j in range(self.num_chunks)]
+        n_acc = len(accO)  # num_chunks, or 2 * num_chunks: [O_hi, O_lo] per chunk (fp8_mma)
+        tOaccO_ld = [thr_ldO.partition_S(accO[j]) for j in range(n_acc)]
+        tOaccO_st = [thr_stO.partition_D(accO[j]) for j in range(n_acc)]
 
         Consumer = pipeline.PipelineUserType.Consumer
         cs_O = pipeline.make_pipeline_state(Consumer, 1)
@@ -1132,7 +1186,7 @@ class FlashAttentionMLADecodeSm100:
             pl_stats.consumer_wait(cs_st)  # scale of block b, from softmax(b)
             pl_O.consumer_wait(cs_O)  # accumulator state after O^T(b-1)
             fa_sm100_utils.fence_tcgen05_after_thread_sync()
-            for j in cutlass.range_constexpr(self.num_chunks):
+            for j in cutlass.range_constexpr(n_acc):
                 cute.copy(thr_ldO, tOaccO_ld[j], tOrO)
                 cute.arch.fence_view_async_tmem_load()
                 for i in cutlass.range_constexpr(h):
@@ -1165,9 +1219,21 @@ class FlashAttentionMLADecodeSm100:
         bar_corr.arrive_and_wait()
 
         fa_sm100_utils.fence_tcgen05_after_thread_sync()
+        if const_expr(self.fp8_mma):
+            tOrO_lo = cute.make_rmem_tensor(cO_t2r.shape, Float32)
         for j in cutlass.range_constexpr(self.num_chunks):
-            cute.copy(thr_ldO, tOaccO_ld[j], tOrO)
-            cute.arch.fence_view_async_tmem_load()
+            if const_expr(not self.fp8_mma):
+                cute.copy(thr_ldO, tOaccO_ld[j], tOrO)
+                cute.arch.fence_view_async_tmem_load()
+            else:
+                # O = (O_hi + 2^-4 O_lo) * 2^-8: undo the P operand scales (powers of two)
+                cute.copy(thr_ldO, tOaccO_ld[2 * j], tOrO)
+                cute.copy(thr_ldO, tOaccO_ld[2 * j + 1], tOrO_lo)
+                cute.arch.fence_view_async_tmem_load()
+                for i in cutlass.range_constexpr(h):
+                    tOrO[i] = (tOrO[i] + tOrO_lo[i] * (1.0 / FP8_P_LO_SCALE)) * (
+                        1.0 / FP8_P_SCALE
+                    )
             for i in cutlass.range_constexpr(h):
                 dv = j * self.dv_chunk + cO_t2r[i][0]
                 hh = cO_t2r[i][1]
