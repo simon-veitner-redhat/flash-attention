@@ -71,6 +71,7 @@ class FlashAttentionMLADecodeSm100:
         # gathered stages. The caller folds q_scale * k_scale into softmax_scale and multiplies
         # the (bf16) O by v_scale.
         self.fp8_mma = False
+        self.early_gather = False
         self.o_cols = None  # N of the O^T MMA: h, or 2h for the stacked [P_hi | P_lo]
         self.n_rope = 1
         # S^T accumulators and P^T buffers: 2 for fp8_mma, so S^T(b + 1) and softmax(b + 1)
@@ -118,6 +119,10 @@ class FlashAttentionMLADecodeSm100:
         self.bar_id_tmem = 1
         self.bar_id_softmax = 2
         self.bar_id_corr = 3
+        self.bar_id_gather_go = 4  # early_gather: warp 0 -> gather warps, mbarriers ready
+        # early_gather: the setup barrier, which the gather warps only arrive on (bar.arrive on
+        # barrier 0 against the count-less bar.sync 0 faults)
+        self.bar_id_setup = 5
 
         self.num_stages_stats = 2
 
@@ -234,6 +239,10 @@ class FlashAttentionMLADecodeSm100:
             "sparse decode requires 16-bit or e4m3 KV"
         )
         self.fp8_mma = dtype == cutlass.Float8E4M3FN
+        # fp8 split-KV grids (few tiles per CTA, so the head start matters): the gather warps
+        # start as soon as their own pipelines exist. Unsplit grids keep the CTA-wide setup
+        # barrier (an early gather measured 1.8% slower at h8 b128).
+        self.early_gather = self.fp8_mma and self.is_split_kv
         self.dtype_O = mO.element_type
 
         new_stride = lambda mX: (
@@ -448,6 +457,15 @@ class FlashAttentionMLADecodeSm100:
         # arrive.noinc does not bump the pending count: arrive count must equal the gather threads
         assert pl_lat.sync_object_full.arrive_count == self.num_gather_threads
         assert pl_rope.sync_object_full.arrive_count == self.num_gather_threads
+        if const_expr(self.early_gather):
+            # the gather warps need only these two pipelines: release them as soon as their
+            # mbarriers are initialized, not after every other init and the TMEM alloc
+            bar_go = pipeline.NamedBarrier(
+                barrier_id=self.bar_id_gather_go, num_threads=32 + self.num_gather_threads
+            )
+            if warp_idx == 0:
+                cute.arch.mbarrier_init_fence()
+                bar_go.arrive()
 
         pl_S = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.mbar_S.data_ptr(), num_stages=self.n_sp,
@@ -495,9 +513,27 @@ class FlashAttentionMLADecodeSm100:
         tmem.allocate(self.tmem_alloc_cols)
 
         cute.arch.mbarrier_init_fence()
-        cute.arch.barrier()
-        tmem.wait_for_alloc()
-        tmem_ptr = tmem.retrieve_ptr(Float32)
+        if const_expr(not self.early_gather):
+            cute.arch.barrier()
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
+        else:
+            # gather warps: no TMEM, so they only arrive on the setup and TMEM barriers (their
+            # next use of either is the teardown's tmem_bar) and wait for their pipelines
+            tmem_addr = Int32(0)
+            if warp_idx < self.gather_warp_lo:
+                cute.arch.barrier(barrier_id=self.bar_id_setup, number_of_threads=self.num_threads)
+                tmem.wait_for_alloc()
+                tmem_addr = storage.tmem_holding.get_tensor(cute.make_layout(1))[0]
+            else:
+                cute.arch.barrier_arrive(
+                    barrier_id=self.bar_id_setup, number_of_threads=self.num_threads
+                )
+                tmem_bar.arrive()
+                bar_go.arrive_and_wait()
+            tmem_ptr = cute.make_ptr(
+                Float32, tmem_addr, cute.AddressSpace.tmem, assumed_align=16
+            )
         if const_expr(self.fp8_mma):
             n_block_lo, num_n_blocks = self._block_range(valid_len, split_idx)
             batch_idx, seqlen = self._resolve_batch(
