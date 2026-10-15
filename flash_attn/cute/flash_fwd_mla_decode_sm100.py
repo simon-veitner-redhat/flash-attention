@@ -72,6 +72,7 @@ class FlashAttentionMLADecodeSm100:
         # the (bf16) O by v_scale.
         self.fp8_mma = False
         self.early_gather = False
+        self.balanced_splits = False
         self.o_cols = None  # N of the O^T MMA: h, or 2h for the stacked [P_hi | P_lo]
         self.n_rope = 1
         # S^T accumulators and P^T buffers: 2 for fp8_mma, so S^T(b + 1) and softmax(b + 1)
@@ -243,6 +244,7 @@ class FlashAttentionMLADecodeSm100:
         # start as soon as their own pipelines exist. Unsplit grids keep the CTA-wide setup
         # barrier (an early gather measured 1.8% slower at h8 b128).
         self.early_gather = self.fp8_mma and self.is_split_kv
+        self.balanced_splits = self.fp8_mma and self.is_split_kv
         self.dtype_O = mO.element_type
 
         new_stride = lambda mX: (
@@ -369,14 +371,17 @@ class FlashAttentionMLADecodeSm100:
             # setup barrier, so their latency hides under the barrier init and TMEM alloc
             if const_expr(mTopkValidLen is not None):
                 valid_len = mTopkValidLen[m_idx]
-            if const_expr(not self.is_split_kv):
+            if const_expr(not self.is_split_kv or mTopkValidLen is None):
+                # the gather's first top-k index (CpasyncGatherKVManager.load_index_topk map);
+                # balanced splits start where the valid length says, so they load it later
                 idx_lo = Int32(0)
-            else:
-                idx_lo = split_idx * Int32(self.blocks_per_split * self.tile_n)
-            idx_first = Int32(0)
-            if warp_idx >= self.gather_warp_lo:
-                # the gather's first top-k index (CpasyncGatherKVManager.load_index_topk map)
-                idx_first = mIndexTopk[idx_lo + self._gather_index_row(tidx - self.gather_tid_lo), m_idx]
+                if const_expr(self.is_split_kv):
+                    idx_lo = split_idx * Int32(self.blocks_per_split * self.tile_n)
+                idx_first = Int32(0)
+                if warp_idx >= self.gather_warp_lo:
+                    idx_first = mIndexTopk[
+                        idx_lo + self._gather_index_row(tidx - self.gather_tid_lo), m_idx
+                    ]
             # batch lookup: decode requests carry 1 or 2 queries (2 with MTP), so batch = m_idx
             # and m_idx / 2 are checked (four independent loads) before the binary search, and
             # the K lengths of batch m_idx are loaded speculatively alongside; all resolved
@@ -770,6 +775,15 @@ class FlashAttentionMLADecodeSm100:
         if const_expr(not self.is_split_kv):
             n_block_lo = Int32(0)
             num_n_blocks = n_valid_blocks
+        elif const_expr(self.balanced_splits and valid_len is not None):
+            # fp8: the S splits share the valid window evenly (ceil(valid blocks / S) each),
+            # instead of a fixed share of the full top-k width that leaves most splits
+            # all-masked when the valid length is short (DCP ranks, short contexts). The
+            # combine weights every split by its LSE, so any partition is exact; a split
+            # past the window still walks one all-masked block (block index < n_blocks_full).
+            bps = (n_valid_blocks + Int32(self.num_splits - 1)) // Int32(self.num_splits)
+            n_block_lo = split_idx * bps
+            num_n_blocks = max(Int32(1), min(n_valid_blocks, n_block_lo + bps) - n_block_lo)
         else:
             # a split entirely past the valid window still walks one all-masked block
             n_block_lo = split_idx * Int32(self.blocks_per_split)
