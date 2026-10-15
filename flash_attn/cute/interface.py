@@ -373,18 +373,23 @@ def _fused_combine_semaphores(device, num_splits, num_groups):
     return buf
 
 
-def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks):
+def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks, fp8_kv=False):
     """Choose head groups and KV splits for the sparse decode grid.
 
     More than 16 query heads per KV head only reach this kernel when DCP gathers 16 heads per
     rank, so each rank holds about 16 / qhead_per_kvhead of the top-k, packed at the front of the
     gather width. Such grids split at least qhead_per_kvhead // 8 ways, so that two splits see
     valid blocks, and never spend an extra wave on splitting.
+
+    fp8_kv: the e4m3 kernel splits the valid window evenly at run time (every split sees valid
+    blocks whatever the valid length), so its > 16-head grids may split two ways.
     """
     supported = FlashAttentionMLADecodeSm100.SUPPORTED_HEADS
     waves = lambda groups, splits: -(-total_q * nheads_kv * groups * splits // num_SMs)
     head_groups = next(g for g in (1, 2, 4, 8) if qhead_per_kvhead // g in supported)
     min_splits, extra_waves = (qhead_per_kvhead // 8, 0) if qhead_per_kvhead > 16 else (2, 1)
+    if fp8_kv:
+        min_splits = 2
     # Fewest waves per split, with at least two blocks per split.
     candidates = [1] + [
         s
@@ -1088,6 +1093,7 @@ def _flash_attn_fwd(
             total_q, num_head_kv, qhead_per_kvhead,
             get_num_sms_for_selection(device.index, arch),
             gather_kv_indices.shape[-1] // 128,
+            fp8_kv=is_fp8,
         )
         num_splits = decode_splits[1]
 
