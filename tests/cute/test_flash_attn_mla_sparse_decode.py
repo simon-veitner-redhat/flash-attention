@@ -240,3 +240,43 @@ def test_decode_leading_empty_block(dtype, num_heads, tokens, topk, use_valid_le
         softmax_scale=SOFTMAX_SCALE,
     )[0]
     torch.testing.assert_close(out, torch.ones_like(out), atol=0.002, rtol=0)
+
+
+def fp8_flat_kv(num_rows, device, seed, poison_rows=4):
+    """A per-tensor e4m3 flat cache (vLLM `fp8`: latent then rope, 576 B rows) placed right
+    after rows of NaN bytes (0x7F), so a -1 sentinel that reached the load would poison O."""
+    _, k16, v16 = flat_kv.make_flat_kv(num_rows, device, seed=seed)
+    store = torch.full((poison_rows + num_rows, 1, 576), 0x7F, device=device, dtype=torch.uint8)
+    store[poison_rows:, :, :512] = v16.to(torch.float8_e4m3fn).view(torch.uint8)
+    store[poison_rows:, :, 512:] = k16.to(torch.float8_e4m3fn).view(torch.uint8)
+    kv8 = store[poison_rows:].view(torch.float8_e4m3fn)
+    return kv8, kv8[..., 512:], kv8[..., :512]
+
+
+@pytest.mark.parametrize("total_q", [9, 148])
+@pytest.mark.parametrize(
+    "num_heads,dtype",
+    [(8, torch.bfloat16), (16, torch.bfloat16), (32, torch.bfloat16), (64, torch.bfloat16),
+     (16, torch.float16), (8, torch.float8_e4m3fn), (32, torch.float8_e4m3fn)],
+)
+def test_decode_fp8_kv_bitwise_vs_upcast_cache(num_heads, dtype, total_q):
+    """e4m3 K/V (and an e4m3 Q) convert exactly in-kernel: O and LSE match the 16-bit kernel on
+    the upcast inputs bit for bit, including ragged/empty rows and -1 sentinels next to NaN
+    bytes. An e4m3 Q computes, and returns, in bf16."""
+    device = "cuda"
+    dtype16 = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    counts = ragged_counts(total_q)
+    kv8, k8, v8 = fp8_flat_kv(NUM_KV_ROWS, device, seed=60 + total_q)
+    kv16 = kv8.to(dtype16)
+    q, qv = flat_kv.make_q(total_q, device, dtype=dtype, seed=61, num_heads=num_heads)
+    idx, valid_len = flat_kv.make_indices(counts, NUM_KV_ROWS, device, seed=62)
+    cu_seqlens_q = flat_kv.cu_seqlens_from([1] * total_q, device)
+
+    out8, lse8 = run_decode(q, qv, k8, v8, cu_seqlens_q, idx, valid_len)
+    out16, lse16 = run_decode(
+        q.to(dtype16), qv.to(dtype16), kv16[..., 512:], kv16[..., :512], cu_seqlens_q, idx,
+        valid_len,
+    )
+    assert out8.dtype == dtype16
+    assert torch.equal(out8, out16), "fp8 output differs from the 16-bit kernel on the upcast cache"
+    assert torch.equal(lse8, lse16), "fp8 LSE differs from the 16-bit kernel on the upcast cache"
