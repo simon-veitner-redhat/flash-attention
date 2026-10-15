@@ -27,7 +27,7 @@ LN2 = math.log(2.0)
 
 SMEM_CAP_BYTES = 232448  # the measured SM100 dynamic-smem ceiling
 
-# h -> (latent ring depth, P^T aliased onto the rope ring).  n_rope = n_pt = 1 always.
+# 16-bit KV: h -> (latent ring depth, P^T aliased onto the rope ring); 1 rope stage, 1 P^T.
 _RING = {8: (6, False), 16: (6, True), 32: (5, False)}
 # fp8 KV with an e4m3 Q: kind::f8f6f4 MMAs straight on the gathered e4m3 stages (16 KB per
 # latent stage). h -> latent ring depth; the rope ring has 2 stages and P^T is never aliased.
