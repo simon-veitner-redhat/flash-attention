@@ -1047,31 +1047,3 @@ def as_shhb_tensor(
             ),
         ),
     )
-
-
-@dsl_user_op
-def cvt_e4m3x4_to_16bit(
-    x: cutlass.Int32, to_dtype: Type, *, loc=None, ip=None
-) -> Tuple[cutlass.Int32, cutlass.Int32]:
-    """Four packed e4m3 bytes -> two packed f16x2/bf16x2 words (bytes 0-1, then bytes 2-3).
-
-    Exact for every e4m3 value, NaN included. Inline PTX because TensorSSA.to(BFloat16) widens
-    through f16 and f32 (four instructions per pair) and nvvm.convert.f8x2.to.bf16x2 rejects
-    e4m3; cvt.rn.bf16x2.e4m3x2 (PTX ISA 9.2, sm_100f) is one F2FP per pair.
-    """
-    assert to_dtype in [cutlass.BFloat16, cutlass.Float16], "to_dtype must be BFloat16 or Float16"
-    dst = "bf16x2" if to_dtype is cutlass.BFloat16 else "f16x2"
-    res = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [cutlass.Int32(x).ir_value(loc=loc, ip=ip)],
-        "{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, $2;\n"
-        f"cvt.rn.{dst}.e4m3x2 $0, lo;\ncvt.rn.{dst}.e4m3x2 $1, hi;\n}}",
-        "=r,=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return (
-        cutlass.Int32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
-        cutlass.Int32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
-    )

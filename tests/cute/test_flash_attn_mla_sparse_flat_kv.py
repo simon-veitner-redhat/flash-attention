@@ -350,14 +350,16 @@ def test_valid_length_broadcast_cache_reuse():
             torch.testing.assert_close(out[b], ref, atol=0.015, rtol=0.015)
 
 
-def test_fp8_kv_outside_the_decode_kernel_raises():
-    """fp8 K/V with a 16-bit qv only runs on the sparse decode kernel: 128 heads must not misroute."""
+def test_fp8_kv_unsupported_routes_raise():
+    """fp8 MLA runs only on the sparse decode kernel and only with an e4m3 q/qv."""
     device = "cuda"
-    kv, k, v = make_flat_kv(1024, device)
-    q, qv = make_q(4, device, num_heads=128)
+    _, k, v = make_flat_kv(1024, device)
+    k8, v8 = k.to(torch.float8_e4m3fn), v.to(torch.float8_e4m3fn)
     idx, valid_len = make_indices([256] * 4, 1024, device, topk=256)
-    with pytest.raises(NotImplementedError, match="sparse MLA decode kernel"):
-        run_kernel(
-            q, qv, k.to(torch.float8_e4m3fn), v.to(torch.float8_e4m3fn),
-            cu_seqlens_from([1] * 4, device), 1024, idx, valid_len,
-        )
+    cu_seqlens_q = cu_seqlens_from([1] * 4, device)
+    q, qv = make_q(4, device, num_heads=16)
+    with pytest.raises(NotImplementedError, match="needs an e4m3 q/qv"):
+        run_kernel(q, qv, k8, v8, cu_seqlens_q, 1024, idx, valid_len)
+    q, qv = [t.to(torch.float8_e4m3fn) for t in make_q(4, device, num_heads=128)]
+    with pytest.raises(NotImplementedError, match="sparse decode kernel"):
+        run_kernel(q, qv, k8, v8, cu_seqlens_q, 1024, idx, valid_len)

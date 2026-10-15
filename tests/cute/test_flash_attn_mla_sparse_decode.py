@@ -58,26 +58,17 @@ def run_decode(q, qv, k, v, cu_seqlens_q, idx, valid_len, return_lse=True):
     )
 
 
-# fp8 flavors of a decode call: None (16-bit q/kv), "kv" (e4m3 K/V, 16-bit q: staged
-# conversion), "kvq" (e4m3 K/V and q: kind::f8f6f4 MMAs)
-FP8_FLAVORS = [None, "kv", "kvq"]
-
-
-def to_fp8(flavor, q, qv, kv):
-    """Kernel inputs for an fp8 flavor, plus the 16-bit references they upcast to exactly."""
-    if flavor is None:
-        return (q, qv, kv[..., 512:], kv[..., :512]), (q, qv, kv)
-    kv8 = kv.to(torch.float8_e4m3fn)
-    kv_ref = kv8.to(kv.dtype)
-    if flavor == "kvq":
-        q8, qv8 = q.to(torch.float8_e4m3fn), qv.to(torch.float8_e4m3fn)
-        return (q8, qv8, kv8[..., 512:], kv8[..., :512]), (q8.to(q.dtype), qv8.to(qv.dtype), kv_ref)
-    return (q, qv, kv8[..., 512:], kv8[..., :512]), (q, qv, kv_ref)
+def to_fp8(fp8, q, qv, kv):
+    """Kernel inputs (e4m3 q/qv/K/V if fp8), plus the 16-bit references they upcast to exactly."""
+    if fp8:
+        q, qv, kv = [t.to(torch.float8_e4m3fn) for t in (q, qv, kv)]
+        return (q, qv, kv[..., 512:], kv[..., :512]), [t.to(torch.bfloat16) for t in (q, qv, kv)]
+    return (q, qv, kv[..., 512:], kv[..., :512]), (q, qv, kv)
 
 
 def check(
     q_lens, counts, num_heads=16, split_views=True, seed=0,
-    dtype=torch.bfloat16, use_valid_length=True, pad=-1, fp8=None,
+    dtype=torch.bfloat16, use_valid_length=True, pad=-1, fp8=False,
 ):
     device = "cuda"
     cu_seqlens_q = flat_kv.cu_seqlens_from(q_lens, device)
@@ -124,7 +115,7 @@ def test_decode_without_valid_length(dtype, num_heads):
     check([1] * 9, ragged_counts(9), num_heads=num_heads, dtype=dtype, use_valid_length=False)
 
 
-@pytest.mark.parametrize("fp8", FP8_FLAVORS)
+@pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("pad", [-1, -2147483648, 1 << 20])
 def test_decode_out_of_range_padding_sentinels(pad, fp8):
     """The gather forms a gmem pointer from the raw index, so any sentinel must be predicated."""
@@ -195,7 +186,7 @@ def test_decode_preallocated_lse(total_q):
     torch.testing.assert_close(out, out_ref, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("fp8", FP8_FLAVORS)
+@pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("kv_heads", [[1, 2, 1], [2, 1, 2]])
 def test_decode_cache_reuse_and_kv_offsets(kv_heads, fp8):
     """Changing the dynamic KV-head count must update grid Y on a cache hit."""
@@ -239,9 +230,7 @@ def test_decode_cache_reuse_and_kv_offsets(kv_heads, fp8):
 
 
 @pytest.mark.parametrize(
-    "dtype,fp8",
-    [(torch.float16, None), (torch.bfloat16, None), (torch.bfloat16, "kv"),
-     (torch.bfloat16, "kvq")],
+    "dtype,fp8", [(torch.float16, False), (torch.bfloat16, False), (torch.bfloat16, True)]
 )
 @pytest.mark.parametrize("num_heads", [8, 16, 32])
 @pytest.mark.parametrize("tokens,topk", [(1, 2048), (148, 256)])
@@ -281,8 +270,8 @@ def fp8_flat_kv(num_rows, device, seed, poison_rows=4):
 
 
 def run_fp8_and_upcast(q, qv, kv8, idx, valid_len):
-    """The decode kernel on e4m3 K/V (and q) and the 16-bit kernel on the exact upcast."""
-    dtype16 = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+    """The decode kernel on e4m3 q/qv/K/V and the bf16 kernel on the exact upcast."""
+    dtype16 = torch.bfloat16
     kv16 = kv8.to(dtype16)
     cu_seqlens_q = flat_kv.cu_seqlens_from([1] * q.shape[0], q.device)
     out8, lse8 = run_decode(q, qv, kv8[..., 512:], kv8[..., :512], cu_seqlens_q, idx, valid_len)
@@ -295,8 +284,8 @@ def run_fp8_and_upcast(q, qv, kv8, idx, valid_len):
 
 
 def assert_fp8_q_close(out8, lse8, out16, lse16, counts):
-    """e4m3 q: P^T is e4m3 hi + lo terms, so O matches to ~2^-8 and the LSE (fp32 scores of
-    the same e4m3 products) to rounding."""
+    """P^T is e4m3 hi + lo terms, so O matches to ~2^-8 and the LSE (fp32 scores of the same
+    e4m3 products) to rounding."""
     assert torch.isfinite(out8).all(), "NaN/inf in the fp8-MMA output"
     empty = torch.tensor([n == 0 for n in counts], device=out8.device)
     assert (out8[empty] == 0).all() and (lse8[empty] == -math.inf).all()
@@ -307,26 +296,19 @@ def assert_fp8_q_close(out8, lse8, out16, lse16, counts):
 
 
 @pytest.mark.parametrize("total_q", [9, 148])
-@pytest.mark.parametrize(
-    "num_heads,dtype",
-    [(8, torch.bfloat16), (16, torch.bfloat16), (32, torch.bfloat16), (64, torch.bfloat16),
-     (16, torch.float16), (8, torch.float8_e4m3fn), (16, torch.float8_e4m3fn),
-     (32, torch.float8_e4m3fn), (64, torch.float8_e4m3fn)],
-)
-def test_decode_fp8_kv_vs_upcast_cache(num_heads, dtype, total_q):
-    """fp8 e4m3 K/V against the 16-bit kernel on the upcast inputs, with ragged/empty rows and
-    -1 sentinels next to NaN bytes. A 16-bit Q widens K/V exactly: O and LSE match bit for bit."""
+@pytest.mark.parametrize("num_heads", HEADS)
+def test_decode_fp8_vs_upcast_cache(num_heads, total_q):
+    """e4m3 q/K/V against the bf16 kernel on the upcast inputs, with ragged/empty rows and
+    -1 sentinels next to NaN bytes."""
     device = "cuda"
     counts = ragged_counts(total_q)
     kv8, _, _ = fp8_flat_kv(NUM_KV_ROWS, device, seed=60 + total_q)
-    q, qv = flat_kv.make_q(total_q, device, dtype=dtype, seed=61, num_heads=num_heads)
+    q, qv = flat_kv.make_q(
+        total_q, device, dtype=torch.float8_e4m3fn, seed=61, num_heads=num_heads
+    )
     idx, valid_len = flat_kv.make_indices(counts, NUM_KV_ROWS, device, seed=62)
     out8, lse8, out16, lse16 = run_fp8_and_upcast(q, qv, kv8, idx, valid_len)
-    if dtype != torch.float8_e4m3fn:
-        assert torch.equal(out8, out16), "fp8 KV output differs from the 16-bit kernel"
-        assert torch.equal(lse8, lse16), "fp8 KV LSE differs from the 16-bit kernel"
-    else:
-        assert_fp8_q_close(out8, lse8, out16, lse16, counts)
+    assert_fp8_q_close(out8, lse8, out16, lse16, counts)
 
 
 @pytest.mark.parametrize("n_blocks", [1, 2, 3])

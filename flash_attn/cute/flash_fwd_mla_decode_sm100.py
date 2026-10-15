@@ -12,14 +12,13 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import Boolean, Float32, Int32, Int64, const_expr
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass import Float32, Int32, Int64, const_expr
+from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import CtaGroup, OperandMajorMode
 
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
-from flash_attn.cute import utils
 from flash_attn.cute.utils import get_batch_from_cu_tensor, warp_reduce
 
 
@@ -30,10 +29,6 @@ SMEM_CAP_BYTES = 232448  # the measured SM100 dynamic-smem ceiling
 
 # h -> (latent ring depth, P^T aliased onto the rope ring).  n_rope = n_pt = 1 always.
 _RING = {8: (6, False), 16: (6, True), 32: (5, False)}
-# fp8 KV, staged gather: h -> (bf16 latent ring depth, fp8 staging slots of 16 KB, P^T aliased
-# on the rope stage). A tile's 4 latent chunks and its rope pass through the slots in order.
-_RING_FP8_STAGED = {8: (4, 3, False), 16: (4, 3, False), 32: (4, 2, True)}
-FP8_STG_CHUNK_BYTES = 128 * 128  # one 128-row x 128-col e4m3 latent chunk
 # fp8 KV with an e4m3 Q: kind::f8f6f4 MMAs straight on the gathered e4m3 stages (16 KB per
 # latent stage). h -> latent ring depth; the rope ring has 2 stages and P^T is never aliased.
 _RING_FP8_MMA = {8: 12, 16: 12, 32: 10}
@@ -64,12 +59,10 @@ class FlashAttentionMLADecodeSm100:
             f"got {h_group}"
         )
 
-        # Per-tensor e4m3 KV rows (latent then rope, 576 B; set in __call__ from the dtypes).
-        # With an e4m3 Q the MMAs run in kind::f8f6f4 on the gathered stages (fp8_mma); under a
-        # 16-bit Q the raw e4m3 is staged and converted exactly to it (fp8_staged). The scales
-        # are the caller's: q_scale * k_scale folds into softmax_scale, v_scale multiplies O.
+        # e4m3 Q and KV (per-tensor scaled 576 B rows, set in __call__): kind::f8f6f4 MMAs on the
+        # gathered stages. The caller folds q_scale * k_scale into softmax_scale and multiplies
+        # the (bf16) O by v_scale.
         self.fp8_mma = False
-        self.fp8_staged = False
         self.o_cols = None  # N of the O^T MMA: h, or 2h for the stacked [P_hi | P_lo]
         self.n_rope = 1
         # S^T accumulators and P^T buffers: 2 for fp8_mma, so S^T(b + 1) and softmax(b + 1)
@@ -107,10 +100,6 @@ class FlashAttentionMLADecodeSm100:
         self.gather_warp_lo = 12
         self.corr_tid_lo = self.corr_warp_lo * 32
         self.gather_tid_lo = self.gather_warp_lo * 32
-        # fp8 staged gather only: the gather warps cp.async into the staging ring and warps
-        # 9-11 (idle in the 16-bit kernel) convert it into the 16-bit stages
-        self.conv_tid_lo = (self.mma_warp_id + 1) * 32
-        self.num_conv_threads = self.gather_tid_lo - self.conv_tid_lo
         self.num_softmax_warps = self.num_softmax_threads // 32
 
         # named barrier ids (0 is bar.sync / cute.arch.barrier)
@@ -128,12 +117,6 @@ class FlashAttentionMLADecodeSm100:
         assert self.tmem_off_O[-1] + self.h <= self.tmem_alloc_cols
 
         self.buffer_align_bytes = 1024
-
-        # fp8 KV only (setmaxnreg per warpgroup; the 16-bit path keeps 128 everywhere): with a
-        # 4-stage ring the MMA warp hoists every stage's descriptors and spills at 128, and the
-        # cp.async loaders need few registers. softmax 128 + correction 128 + 200 + 56 = 512.
-        self.num_regs_mma_wg_staged = 200  # warps 8-11: MMA + the 3 converters
-        self.num_regs_gather_staged = 56  # warps 12-15: the cp.async loaders
 
     # ------------------------------------------------------------------ traced setup
     @cute.jit
@@ -168,7 +151,7 @@ class FlashAttentionMLADecodeSm100:
         assert cute.cosize(Lpt) == self.n_sp * tn * no
         return mma_S, mma_O, LlatK, LlatMN, Lrope, LqtC, LqtR, Lpt
 
-    def _get_shared_storage_cls(self, dtype, n_lat, alias_pt_on_rope, n_stg=0):
+    def _get_shared_storage_cls(self, dtype, n_lat, alias_pt_on_rope):
         align = self.buffer_align_bytes
         h = self.h
         tn = self.tile_n
@@ -191,8 +174,6 @@ class FlashAttentionMLADecodeSm100:
             mbar_stats: cute.struct.MemRange[Int64, 2 * nst]
             mbar_Q: cute.struct.MemRange[Int64, 1]
             tmem_holding: cute.struct.MemRange[Int32, 1]
-            if n_stg > 0:  # fp8 staged gather only (the 16-bit layout is unchanged)
-                mbar_stg: cute.struct.MemRange[Int64, 2 * n_stg]
             sRed: cute.struct.Align[cute.struct.MemRange[Float32, nw * h], 128]
             sSmMax: cute.struct.Align[cute.struct.MemRange[Float32, h], 128]
             sSmSum: cute.struct.Align[cute.struct.MemRange[Float32, h], 128]
@@ -202,10 +183,6 @@ class FlashAttentionMLADecodeSm100:
             sQt: cute.struct.Align[cute.struct.MemRange[dtype, qt_elems], align]
             sRope: cute.struct.Align[cute.struct.MemRange[dtype, rope_elems], align]
             sLat: cute.struct.Align[cute.struct.MemRange[dtype, lat_elems], align]
-            if n_stg > 0:
-                sStg: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Uint8, n_stg * FP8_STG_CHUNK_BYTES], align
-                ]
 
         return SharedStorage
 
@@ -231,16 +208,11 @@ class FlashAttentionMLADecodeSm100:
             "split-KV needs the partial LSE tensor: flash_fwd_combine reduces on it"
         )
 
-        # the MMA, smem and P^T dtype: Q's
-        dtype = mQv.element_type
+        dtype = mV.element_type
         assert dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN), (
-            "sparse decode requires a 16-bit or e4m3 Q"
-        )
-        assert mK.element_type == mV.element_type in (dtype, cutlass.Float8E4M3FN), (
-            "sparse decode requires KV in Q's dtype or e4m3"
+            "sparse decode requires 16-bit or e4m3 KV"
         )
         self.fp8_mma = dtype == cutlass.Float8E4M3FN
-        self.fp8_staged = mV.element_type != dtype
         self.dtype_O = mO.element_type
 
         new_stride = lambda mX: (
@@ -273,22 +245,15 @@ class FlashAttentionMLADecodeSm100:
         )
 
         self.o_cols = 2 * self.h if const_expr(self.fp8_mma) else self.h
-        if const_expr(self.fp8_staged):
-            # the staged thread maps (the sStg strides, the loader's units and row slots, the
-            # converter's unit math) assume 128 x 128 B chunks of 8 units, 4 rows per row slot
-            assert self.tile_n == self.dv_chunk == FP8_STG_CHUNK_BYTES // 128 == 128
-            assert self.tile_n // (self.num_gather_threads // 4) == 4
-            n_lat, n_stg, alias_pt = _RING_FP8_STAGED[self.h]
-        elif const_expr(self.fp8_mma):
+        if const_expr(self.fp8_mma):
             # S^T stages at [0, h) and [h, 2h); O_j^T = [O_hi | O_lo] at 2h + 2hj
             self.n_sp, self.n_rope = 2, 2
             self.tmem_off_O = [2 * self.h * (1 + j) for j in range(self.num_chunks)]
             assert self.tmem_off_O[-1] + 2 * self.h <= self.tmem_alloc_cols
-            n_lat, n_stg, alias_pt = _RING_FP8_MMA[self.h], 0, False
+            n_lat, alias_pt = _RING_FP8_MMA[self.h], False
         else:
-            (n_lat, alias_pt), n_stg = _RING[self.h], 0
-        self.n_stg = n_stg
-        SharedStorage = self._get_shared_storage_cls(dtype, n_lat, alias_pt, n_stg)
+            n_lat, alias_pt = _RING[self.h]
+        SharedStorage = self._get_shared_storage_cls(dtype, n_lat, alias_pt)
         smem_bytes = SharedStorage.size_in_bytes()
         assert smem_bytes <= SMEM_CAP_BYTES, (
             f"h={self.h}: {smem_bytes} B exceeds the {SMEM_CAP_BYTES} B smem cap"
@@ -314,9 +279,6 @@ class FlashAttentionMLADecodeSm100:
             block=(self.num_threads, 1, 1),
             smem=smem_bytes,
             stream=stream,
-            # .minnctapersm 1 gives ptxas the entry register count that setmaxnreg needs
-            # (0, the default, emits no directive)
-            min_blocks_per_mp=1 if const_expr(self.fp8_staged) else 0,
         )
 
     # ------------------------------------------------------------------ kernel
@@ -348,7 +310,7 @@ class FlashAttentionMLADecodeSm100:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, head_kv, _ = cute.arch.block_idx()
-        dtype = mQv.element_type
+        dtype = mV.element_type
         h = const_expr(self.h)
 
         # ==== grid decode: x = (token, KV split, head group), head group fastest =====
@@ -415,19 +377,6 @@ class FlashAttentionMLADecodeSm100:
         sScale = storage.sScale.get_tensor(cute.make_layout((self.num_stages_stats, h)))
 
         # no zero-fill needed: masked rows gather with cp.async src_size = 0, which zero-fills
-        sStg = sStgR = None
-        if const_expr(self.fp8_staged):
-            # (16 B, unit, row, slot); unit u of row r sits at u ^ (4 * (r & 1)) (see gather). A
-            # CuTe Swizzle<1, 6, 1> pointer instead costs ~250 SASS instructions.
-            sStg = cute.make_tensor(
-                cute.recast_ptr(storage.sStg.data_ptr(), dtype=cutlass.Float8E4M3FN),
-                cute.make_layout((16, 8, self.tile_n, self.n_stg), stride=(1, 16, 128, 128 * 128)),
-            )
-            # the tile's rope goes through the same ring, 64 B rows in the slot's first 8 KB
-            sStgR = cute.make_tensor(
-                cute.recast_ptr(storage.sStg.data_ptr(), dtype=cutlass.Float8E4M3FN),
-                cute.make_layout((16, 4, self.tile_n, self.n_stg), stride=(1, 16, 64, 128 * 128)),
-            )
 
         # ==== pipelines =============================================================
         cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
@@ -436,31 +385,19 @@ class FlashAttentionMLADecodeSm100:
         sm_grp = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_softmax_threads)
         corr_grp = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_corr_threads)
 
-        # the bf16 stages' producers: the gather warps, or the converter warps (fp8 staged)
-        lat_grp = gather_grp
-        pl_stg = None
-        if const_expr(self.fp8_staged):
-            lat_grp = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_conv_threads)
-            load_grp = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_gather_threads)
-            pl_stg = pipeline.PipelineAsync.create(
-                barrier_storage=storage.mbar_stg.data_ptr(), num_stages=self.n_stg,
-                producer_group=load_grp, consumer_group=lat_grp, defer_sync=True,
-            )
-            # cp.async arrive.noinc: the staging full barriers count the loader threads
-            assert pl_stg.sync_object_full.arrive_count == self.num_gather_threads
         pl_lat = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.mbar_lat.data_ptr(), num_stages=self.n_lat,
-            producer_group=lat_grp, consumer_group=mma_grp,
+            producer_group=gather_grp, consumer_group=mma_grp,
             cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
         )
         pl_rope = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.mbar_rope.data_ptr(), num_stages=self.n_rope,
-            producer_group=lat_grp, consumer_group=mma_grp,
+            producer_group=gather_grp, consumer_group=mma_grp,
             cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
         )
         # arrive.noinc does not bump the pending count: arrive count must equal the gather threads
-        assert pl_lat.sync_object_full.arrive_count == lat_grp.size
-        assert pl_rope.sync_object_full.arrive_count == lat_grp.size
+        assert pl_lat.sync_object_full.arrive_count == self.num_gather_threads
+        assert pl_rope.sync_object_full.arrive_count == self.num_gather_threads
 
         pl_S = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.mbar_S.data_ptr(), num_stages=self.n_sp,
@@ -544,41 +481,17 @@ class FlashAttentionMLADecodeSm100:
                 tidx, head_kv, m_idx, hg_idx, split_idx,
                 softmax_scale_log2, num_n_blocks,
             )
-        elif const_expr(not self.fp8_staged):
-            # 16-bit KV, and fp8 KV with kind::f8f6f4 MMAs: the cp.async gather fills the
-            # MMA's stages directly
-            if warp_idx == self.mma_warp_id:
-                self.mma_loop(
-                    mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
-                    pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
-                )
-            elif warp_idx >= self.gather_warp_lo:
-                self.gather_loop(
-                    mIndexTopk, mK, mV, sLatK, sRope, pl_lat, pl_rope,
-                    tidx, warp_idx, m_idx, seqlen, batch_idx, head_kv, seqlen_k_limit,
-                    dtype, n_block_lo, num_n_blocks,
-                )
-        else:
-            # setmaxnreg stays inside each role's branch, so ptxas knows every region's budget
-            if warp_idx < self.gather_warp_lo:
-                cute.arch.setmaxregister_increase(self.num_regs_mma_wg_staged)
-                if warp_idx == self.mma_warp_id:
-                    self.mma_loop(
-                        mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
-                        pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
-                    )
-                else:
-                    self.convert_loop_fp8(
-                        sStg, sStgR, sLatK, sRope, pl_stg, pl_lat, pl_rope,
-                        tidx, dtype, num_n_blocks,
-                    )
-            else:
-                cute.arch.setmaxregister_decrease(self.num_regs_gather_staged)
-                self.gather_loop_fp8_staged(
-                    mIndexTopk, mK, mV, sStg, sStgR, pl_stg,
-                    tidx, m_idx, seqlen, batch_idx, head_kv, seqlen_k_limit,
-                    n_block_lo, num_n_blocks,
-                )
+        elif warp_idx == self.mma_warp_id:
+            self.mma_loop(
+                mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
+                pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
+            )
+        elif warp_idx >= self.gather_warp_lo:
+            self.gather_loop(
+                mIndexTopk, mK, mV, sLatK, sRope, pl_lat, pl_rope,
+                tidx, warp_idx, m_idx, seqlen, batch_idx, head_kv, seqlen_k_limit,
+                dtype, n_block_lo, num_n_blocks,
+            )
 
         # ==== TMEM teardown (all 512 threads) =======================================
         tmem.relinquish_alloc_permit()
@@ -631,201 +544,6 @@ class FlashAttentionMLADecodeSm100:
             ps_rope.advance()
 
         # every empty-barrier arrive (a tcgen05 commit from the MMA warp) must have landed
-        pl_lat.producer_tail(ps_lat)
-        pl_rope.producer_tail(ps_rope)
-
-    # ============================================ fp8 KV, staged gather (cp.async)
-    # The loader warps 12-15 cp.async raw e4m3 rows into a ring of n_stg 16 KB staging slots
-    # (src-size 0 zero-fills a row whose index is outside [0, seqlen_k), so stale or NaN bytes
-    # never reach the MMA). Per tile five items pass through the ring: latent chunks 0-3
-    # (128 rows x 128 B) and the rope (128 rows x 64 B in a slot's first 8 KB). Thread map:
-    # 4 threads per row, 32 row slots, slot q owns rows q + 32 * i and its lane l the 16 B
-    # units {l, l + 4} of a latent row (unit l of a rope row). Latent slots keep unit u of row
-    # r at u ^ (4 * (r & 1)), so these cp.async writes and the converters' LDS.128 both cover
-    # all 32 banks per quarter warp. The converter warps 9-11 (idle in the 16-bit kernel)
-    # turn each slot into its swizzled 16-bit stage: LDS.128 -> cvt.rn.bf16x2.e4m3x2 ->
-    # 2 x conflict-free STS.128, then fence.proxy.async.shared::cta (no global loads are in
-    # flight in these threads, so its MEMBAR is cheap), the stage's producer commit and the
-    # slot's release.
-
-    FP8_CONV_BATCH = 3  # units a converter thread LDSes before their STS
-
-    @cute.jit
-    def gather_loop_fp8_staged(
-        self, mIndexTopk, mK, mV, sStg, sStgR, pl_stg,
-        tidx, m_idx, seqlen, batch_idx, head_kv, seqlen_k_limit,
-        n_block_lo, num_n_blocks,
-    ):
-        tn, dvc = self.tile_n, self.dv_chunk
-        ltid = tidx - self.gather_tid_lo
-        n_slots = self.num_gather_threads // 4  # 4 threads per row slot
-        nr = tn // n_slots  # rows per thread: slot + n_slots * i
-        n_own = nr // 4  # tile indices each thread reads: rows slot + n_slots * (lane4 + 4 k)
-        slot = ltid // 4
-        lane4 = ltid % 4
-        par4 = (slot % 2) * 4  # rows slot + n_slots * i share the parity of slot
-        mIdx = mIndexTopk[None, m_idx]
-        mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=2)[None, None, head_kv]
-        mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=2)[None, None, head_kv]
-        atom = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            cutlass.Float8E4M3FN, num_bits_per_copy=128,
-        )
-        rIdx = cute.make_rmem_tensor((nr,), Int32)
-        rOwn = cute.make_rmem_tensor((n_own,), Int32)  # next tile's indices, a tile ahead
-        rOwnN = cute.make_rmem_tensor((n_own,), Int32)  # the tile after that
-
-        ps_stg = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.n_stg)
-
-        last = n_block_lo + num_n_blocks - 1
-        for k in cutlass.range_constexpr(n_own):
-            rOwn[k] = mIdx[n_block_lo * tn + slot + n_slots * (lane4 + 4 * k)]
-        self._fp8_rows_n(rOwn, rIdx)
-        for k in cutlass.range_constexpr(n_own):
-            rOwn[k] = mIdx[min(n_block_lo + 1, last) * tn + slot + n_slots * (lane4 + 4 * k)]
-        for n_block in cutlass.range(num_n_blocks, unroll=1):
-            for k in cutlass.range_constexpr(n_own):
-                rOwnN[k] = mIdx[
-                    min(n_block_lo + n_block + 2, last) * tn + slot + n_slots * (lane4 + 4 * k)
-                ]
-            for c in cutlass.range_constexpr(self.num_chunks):
-                pl_stg.producer_acquire(ps_stg)
-                for i in cutlass.range_constexpr(nr):
-                    for j in cutlass.range_constexpr(2):  # units {lane4, lane4 + 4}
-                        self._fp8_cp_async(
-                            atom, mV_cur, rIdx[i], seqlen_k_limit, c * dvc + 64 * j + 16 * lane4,
-                            sStg[None, (4 * j + lane4) ^ par4, slot + n_slots * i, ps_stg.index],
-                        )
-                cute.arch.cp_async_commit_group()
-                pl_stg.sync_object_full.arrive_cp_async_mbarrier(ps_stg.index)
-                ps_stg.advance()
-            pl_stg.producer_acquire(ps_stg)
-            for i in cutlass.range_constexpr(nr):
-                self._fp8_cp_async(
-                    atom, mK_cur, rIdx[i], seqlen_k_limit, 16 * lane4,
-                    sStgR[None, lane4, slot + n_slots * i, ps_stg.index],
-                )
-            cute.arch.cp_async_commit_group()
-            pl_stg.sync_object_full.arrive_cp_async_mbarrier(ps_stg.index)
-            ps_stg.advance()
-            self._fp8_rows_n(rOwn, rIdx)
-            for k in cutlass.range_constexpr(n_own):
-                rOwn[k] = rOwnN[k]
-
-        # every empty-barrier arrive (from the converters) must have landed
-        pl_stg.producer_tail(ps_stg)
-
-    @cute.jit
-    def _fp8_rows_n(self, rOwn: cute.Tensor, rIdx: cute.Tensor):
-        """rIdx[i] = the index lane i % 4 of this thread's 4-lane slot read as rOwn[i // 4]."""
-        for i in cutlass.range_constexpr(cute.size(rIdx)):
-            rIdx[i] = utils.shuffle_sync(rOwn[i // 4], i % 4, width=4)
-
-    @cute.jit
-    def _fp8_cp_async(self, atom, mX, row, seqlen_k_limit, col, dst):
-        """16 B cp.async of mX[row, col:col+16] into dst; zero-fill (src-size 0) for a row
-        outside [0, seqlen_k_limit)."""
-        # ((atom values, atom rest), rest) = ((16, 1), 1): one 16 B copy and one predicate
-        vl = cute.make_layout(((16, 1), 1), stride=((1, 0), 0))
-        src = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.Float8E4M3FN, utils.elem_pointer(mX, (row, col)).toint(),
-                cute.AddressSpace.gmem, assumed_align=16,
-            ),
-            vl,
-        )
-        pred = cute.make_rmem_tensor((1, 1), Boolean)
-        pred[0] = row >= 0 and row < seqlen_k_limit
-        cute.copy(atom, src, cute.make_tensor(dst.iterator, vl), pred=pred)
-
-    @cute.jit
-    def _fp8_cvt_unit(self, r8, s_nd, row, unit2, dtype):
-        """Convert one 16 B e4m3 unit (registers) and STS it as bf16 units unit2, unit2 + 1."""
-        r32 = cute.recast_tensor(r8, Int32)
-        out = cute.make_rmem_tensor((8, 2), dtype)
-        out32 = cute.recast_tensor(out, Int32)
-        for w in cutlass.range_constexpr(4):
-            out32[2 * w], out32[2 * w + 1] = utils.cvt_e4m3x4_to_16bit(r32[w], dtype)
-        for half in cutlass.range_constexpr(2):
-            cute.autovec_copy(out[None, half], s_nd[(0, None), (row, unit2 + half)])
-
-    @cute.jit
-    def convert_loop_fp8(
-        self, sStg, sStgR, sLatK, sRope, pl_stg, pl_lat, pl_rope,
-        tidx, dtype, num_n_blocks,
-    ):
-        tn, dvc = self.tile_n, self.dv_chunk
-        nct = self.num_conv_threads
-        ctid = tidx - self.conv_tid_lo
-        lat_nd = cute.make_ordered_layout((tn, dvc), order=(0, 1))
-        rope_nd = cute.make_ordered_layout((tn, self.hdim_rope), order=(0, 1))
-        lat_units = tn * dvc // 16
-        rope_units = tn * self.hdim_rope // 16
-
-        Producer = pipeline.PipelineUserType.Producer
-        Consumer = pipeline.PipelineUserType.Consumer
-        cs_stg = pipeline.make_pipeline_state(Consumer, self.n_stg)
-        ps_lat = pipeline.make_pipeline_state(Producer, self.n_lat)
-        ps_rope = pipeline.make_pipeline_state(Producer, 1)
-
-        for _ in cutlass.range(num_n_blocks, unroll=1):
-            for c in cutlass.range_constexpr(self.num_chunks):
-                pl_stg.consumer_wait(cs_stg)
-                pl_lat.producer_acquire(ps_lat)
-                s_nd = cute.zipped_divide(
-                    cute.composition(sLatK[None, None, None, ps_lat.index], lat_nd), (1, 8)
-                )
-                # unit u: 4 consecutive units of one row half, two adjacent rows per quarter warp.
-                # All LDS first: ptxas cannot move an LDS above an STS it may alias.
-                n_it = (lat_units + nct - 1) // nct
-                nb_ = self.FP8_CONV_BATCH
-                r8 = cute.make_rmem_tensor((16, nb_), cutlass.Float8E4M3FN)
-                for it0 in cutlass.range_constexpr(0, n_it, nb_):
-                    for it in cutlass.range_constexpr(it0, min(it0 + nb_, n_it)):
-                        u = ctid + nct * it
-                        if const_expr((it + 1) * nct <= lat_units) or u < lat_units:
-                            r_in = (u // 4) % 2
-                            unit = 4 * ((u // 8) % 2) + u % 4
-                            cute.autovec_copy(
-                                sStg[None, unit ^ (4 * r_in), 2 * (u // 16) + r_in, cs_stg.index],
-                                r8[None, it - it0],
-                            )
-                    for it in cutlass.range_constexpr(it0, min(it0 + nb_, n_it)):
-                        u = ctid + nct * it
-                        if const_expr((it + 1) * nct <= lat_units) or u < lat_units:
-                            r_in = (u // 4) % 2
-                            unit = 4 * ((u // 8) % 2) + u % 4
-                            self._fp8_cvt_unit(
-                                r8[None, it - it0], s_nd, 2 * (u // 16) + r_in, 2 * unit, dtype
-                            )
-                # generic STS -> async-proxy tcgen05.mma reads of this stage (PTX 9.7.17.6.5)
-                cute.arch.fence_proxy("async.shared", space="cta")
-                pl_lat.producer_commit(ps_lat)
-                ps_lat.advance()
-                pl_stg.consumer_release(cs_stg)
-                cs_stg.advance()
-            pl_stg.consumer_wait(cs_stg)
-            pl_rope.producer_acquire(ps_rope)
-            s_nd = cute.zipped_divide(
-                cute.composition(sRope[None, None, None, ps_rope.index], rope_nd), (1, 8)
-            )
-            n_it = (rope_units + nct - 1) // nct
-            r8 = cute.make_rmem_tensor((16, n_it), cutlass.Float8E4M3FN)
-            for it in cutlass.range_constexpr(n_it):
-                u = ctid + nct * it
-                if const_expr((it + 1) * nct <= rope_units) or u < rope_units:
-                    cute.autovec_copy(sStgR[None, u % 4, u // 4, cs_stg.index], r8[None, it])
-            for it in cutlass.range_constexpr(n_it):
-                u = ctid + nct * it
-                if const_expr((it + 1) * nct <= rope_units) or u < rope_units:
-                    self._fp8_cvt_unit(r8[None, it], s_nd, u // 4, 2 * (u % 4), dtype)
-            cute.arch.fence_proxy("async.shared", space="cta")
-            pl_rope.producer_commit(ps_rope)
-            ps_rope.advance()
-            pl_stg.consumer_release(cs_stg)
-            cs_stg.advance()
-
-        # every tcgen05.commit release of the bf16 stages must have landed
         pl_lat.producer_tail(ps_lat)
         pl_rope.producer_tail(ps_rope)
 

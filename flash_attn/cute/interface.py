@@ -776,21 +776,6 @@ def _flash_attn_fwd(
     assert v.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
-    # MLA decode over a per-tensor fp8 e4m3 KV cache (e.g. vLLM's `fp8` 576 B rows). A 16-bit
-    # q/qv widens K/V exactly in-kernel; an e4m3 q/qv runs kind::f8f6f4 MMAs with P^T as e4m3
-    # hi + lo terms (O to ~2^-8 relative, the LSE to fp32 rounding). No descales: the caller
-    # folds q_scale * k_scale into softmax_scale and multiplies the output (q's dtype, bf16 for
-    # an e4m3 q) by v_scale.
-    fp8_kv_mla_decode = (
-        not fp8_kv_dequant
-        and qv is not None
-        and v.dtype == torch.float8_e4m3fn
-        and k is not None
-        and k.dtype == torch.float8_e4m3fn
-        and qv.dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-    )
-    if fp8_kv_mla_decode:
-        assert q is None or q.dtype == qv.dtype, f"q.dtype {q.dtype} != qv.dtype {qv.dtype}"
     if fp8_kv_dequant:
         # FP8-KV in-kernel dequant: fp16/bf16 Q + fp8 e4m3 K/V (dequantized in-kernel to
         # fp16), fp16/bf16 O. Compute is always fp16 (the single-instruction fp8->fp16 fast
@@ -803,7 +788,11 @@ def _flash_attn_fwd(
             "fp8_kv_dequant requires fp8 e4m3 K/V"
         )
         assert page_table is not None, "fp8_kv_dequant requires paged KV (page_table)"
-    elif not fp8_kv_mla_decode:
+    elif qv is not None and v.dtype == torch.float8_e4m3fn and qv.dtype != v.dtype:
+        raise NotImplementedError(
+            f"MLA over an fp8 e4m3 KV cache needs an e4m3 q/qv, got {qv.dtype}"
+        )
+    else:
         input_tensors = {"q": q, "k": k, "v": v, "qv": qv}
         present = {name: t for name, t in input_tensors.items() if t is not None}
         names = list(present.keys())
@@ -866,11 +855,7 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    is_fp8 = (
-        v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        and not fp8_kv_dequant
-        and not fp8_kv_mla_decode
-    )
+    is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not fp8_kv_dequant
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     if output_scale is not None:
@@ -886,11 +871,7 @@ def _flash_attn_fwd(
         output_quant_key = "kFp8StaticTensorSym"
         output_scale = output_scale.reshape(1)
     else:
-        out_torch_dtype = (
-            torch.bfloat16
-            if is_fp8 or (fp8_kv_mla_decode and q_dtype == torch.float8_e4m3fn)
-            else q_dtype
-        )
+        out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
         output_quant_key = None
     device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -1049,7 +1030,7 @@ def _flash_attn_fwd(
         and gather_kv_indices is not None
         and cu_seqlens_q is not None
         and cu_seqlens_k is not None
-        and (q_dtype in (torch.float16, torch.bfloat16) or fp8_kv_mla_decode)
+        and q_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and seqused_q is None
         and page_table is None
         and not requires_grad
@@ -1061,13 +1042,14 @@ def _flash_attn_fwd(
         and qhead_per_kvhead in (8, 16, 32, 64)
         and output_quant_key is None
     )
-    if fp8_kv_mla_decode and not use_sparse_decode:
+    # e4m3 q/qv/K/V MLA (kind::f8f6f4 MMAs, P^T as e4m3 hi + lo terms: O to ~2^-8 relative,
+    # the LSE to fp32 rounding) runs only on the decode kernel. No descales: the caller folds
+    # q_scale * k_scale into softmax_scale and multiplies the bf16 output by v_scale.
+    if is_fp8 and qv is not None and not use_sparse_decode:
         raise NotImplementedError(
-            "fp8 e4m3 K/V with qv is only supported by the SM100/SM110 sparse MLA "
-            "decode kernel: varlen q with gather_kv_indices and cu_seqlens_k, no page_table, "
-            "non-causal, head_dim 64 / head_dim_v 512, 8/16/32/64 query heads per KV head, "
-            f"forward only (got qhead_per_kvhead={qhead_per_kvhead}, arch={arch}, "
-            f"page_table={page_table is not None}, gather={gather_kv_indices is not None})"
+            "fp8 MLA (qv) runs only on the SM100 sparse decode kernel: varlen q with "
+            "gather_kv_indices and cu_seqlens_k, no page_table, non-causal, head_dim 64 / "
+            "head_dim_v 512, 8/16/32/64 query heads per KV head, forward only"
         )
     decode_splits = None
     if use_sparse_decode:
@@ -1521,7 +1503,6 @@ def _flash_attn_fwd(
         out_torch_dtype,
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
-        fp8_kv_mla_decode,
     )
     if use_dedicated_hd256_kernel:
         compile_key += (
@@ -1910,15 +1891,11 @@ def _flash_attn_fwd(
                 t.view(torch.uint8) if t is not None else None
                 for t in (q_call, k_call, v_call, qv_call)
             ]
-        elif fp8_kv_dequant or fp8_kv_mla_decode:
+        elif fp8_kv_dequant:
             # FP8-KV dequant: Q is fp16/bf16 but K/V are fp8 e4m3 -- apply the same uint8
             # FFI workaround to K/V only (the compiled kernel takes them as uint8).
             k_call = k_call.view(torch.uint8)
             v_call = v_call.view(torch.uint8)
-            if q_dtype == torch.float8_e4m3fn:  # fp8 KV MLA decode with an e4m3 q/qv
-                q_call, qv_call = [
-                    t.view(torch.uint8) if t is not None else None for t in (q_call, qv_call)
-                ]
         out_call = out.detach()
         if out_call.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             out_call = out_call.view(torch.uint8)
