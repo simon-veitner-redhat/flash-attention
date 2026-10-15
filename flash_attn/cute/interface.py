@@ -343,6 +343,32 @@ def _make_compile_only_tensor_spec(
     )
 
 
+_FUSED_COMBINE_SEMAPHORES = {}
+
+
+def _fused_combine_semaphores(device, num_splits, num_groups):
+    """Zero-initialized Int64 (groups, S + 1) ticket/claim words for the fused split-KV combine.
+
+    The kernel never resets them: every launch adds exactly S to each group's ticket counter,
+    so one buffer serves any number of stream-ordered launches with the same S (one buffer per
+    (device, S)). Two fused split launches with the same S must not run concurrently on
+    different streams. The buffer grows outside CUDA-graph capture only; a captured launch
+    must fit what an eager warmup call allocated.
+    """
+    key = (device.index, num_splits)
+    buf = _FUSED_COMBINE_SEMAPHORES.get(key)
+    if buf is None or buf.shape[0] < num_groups:
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "fused split-KV combine: run one eager call with this batch size before CUDA-graph "
+            f"capture ({num_groups} groups needed, "
+            f"{0 if buf is None else buf.shape[0]} allocated)"
+        )
+        rows = max(4096, 1 << (num_groups - 1).bit_length())
+        buf = torch.zeros(rows, num_splits + 1, dtype=torch.int64, device=device)
+        _FUSED_COMBINE_SEMAPHORES[key] = buf
+    return buf
+
+
 def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks):
     """Choose head groups and KV splits for the sparse decode grid.
 
@@ -692,6 +718,7 @@ def _flash_attn_fwd(
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
+    sparse_decode_fused_combine: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -1061,6 +1088,9 @@ def _flash_attn_fwd(
         num_splits = decode_splits[1]
 
     is_split_kv = num_splits > 1
+    # sparse decode only, internal opt-in: reduce the KV splits inside the decode kernel
+    # (no FlashAttentionForwardCombine launch); see FlashAttentionMLADecodeSm100._fused_combine
+    fused_combine = bool(sparse_decode_fused_combine) and use_sparse_decode and is_split_kv
     if is_split_kv:
         # flash_fwd_combine wants the query dim contiguous in the partial LSE; qv has it first
         lse_partial_shape = (
@@ -1080,6 +1110,15 @@ def _flash_attn_fwd(
         else:
             out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
             lse_partial = torch.empty(lse_partial_shape, dtype=torch.float32, device=device)
+    fused_sem = None
+    if fused_combine:
+        fused_groups = total_q * num_head_kv * decode_splits[0]
+        if isinstance(q, _CompileOnlyTensorSpec):
+            fused_sem = _make_compile_only_tensor_spec(
+                (fused_groups, num_splits + 1), torch.int64, assumed_align=8
+            )
+        else:
+            fused_sem = _fused_combine_semaphores(device, num_splits, fused_groups)
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -1504,6 +1543,8 @@ def _flash_attn_fwd(
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
     )
+    if fused_combine:
+        compile_key += ("sparse_decode_fused_combine",)
     if use_dedicated_hd256_kernel:
         compile_key += (
             hd256_varlen_b1,
@@ -1664,6 +1705,7 @@ def _flash_attn_fwd(
                     qhead_per_kvhead=qhead_per_kvhead,
                     num_splits=num_splits,
                     num_head_groups=decode_splits[0],
+                    fused_combine=fused_combine,
                 )
             elif qv is not None:
                 paged_kv_cpasync = page_table is not None and page_size != tile_n
@@ -1797,6 +1839,15 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 gather_kv_valid_length_tensor,
                 current_stream,
+                *(
+                    (
+                        to_cute_tensor(out),
+                        to_cute_tensor(lse, assumed_align=4) if lse is not None else None,
+                        to_cute_tensor(fused_sem, assumed_align=8),
+                    )
+                    if fused_combine
+                    else ()
+                ),
                 options="--enable-tvm-ffi",
             )
         elif qv is not None:
@@ -1918,6 +1969,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_k,
                 gather_kv_valid_length,
+                *((out_call, lse, fused_sem) if fused_combine else ()),
             )
         elif qv is not None:
             _flash_attn_fwd.compile_cache[compile_key](
@@ -2000,7 +2052,7 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks,
                 ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
-    if is_split_kv:
+    if is_split_kv and not fused_combine:
         if use_sparse_decode:
             # decode partials are per token row: one batch of length total_q, no cu_seqlens
             _flash_attn_fwd_combine(

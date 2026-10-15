@@ -28,6 +28,10 @@ LN2 = math.log(2.0)
 
 SMEM_CAP_BYTES = 232448  # the measured SM100 dynamic-smem ceiling
 
+# fused combine: how long a finished split CTA waits for its group before leaving its slice to
+# the group's last CTA (only reached if the group's CTAs are not all resident at once)
+FUSED_COMBINE_WAIT_NS = 20000
+
 # 16-bit KV: h -> (latent ring depth, P^T aliased onto the rope ring); 1 rope stage, 1 P^T.
 _RING = {8: (6, False), 16: (6, True), 32: (5, False)}
 # fp8 KV with an e4m3 Q: kind::f8f6f4 MMAs straight on the gathered e4m3 stages (16 KB per
@@ -51,6 +55,7 @@ class FlashAttentionMLADecodeSm100:
         qhead_per_kvhead: int = 16,
         num_splits: int = 1,
         num_head_groups: int = 1,
+        fused_combine: bool = False,
     ):
         assert num_head_groups >= 1 and qhead_per_kvhead % num_head_groups == 0, (
             f"num_head_groups={num_head_groups} must divide qhead_per_kvhead={qhead_per_kvhead}"
@@ -87,6 +92,10 @@ class FlashAttentionMLADecodeSm100:
             f"num_splits={num_splits} must divide topk_length // tile_n = {n_blocks_full}"
         )
         self.is_split_kv = num_splits > 1
+        self.num_splits = num_splits
+        # split-KV only: the S CTAs of a (token, head group) reduce their partials in-kernel
+        # (see _fused_combine) instead of a separate FlashAttentionForwardCombine launch
+        self.fused_combine = fused_combine and self.is_split_kv
         self.n_blocks_full = n_blocks_full
         self.blocks_per_split = n_blocks_full // num_splits
         # head group fastest: the G CTAs that gather the SAME top-k rows stay co-resident
@@ -154,6 +163,9 @@ class FlashAttentionMLADecodeSm100:
         return mma_S, mma_O, LlatK, LlatMN, Lrope, LqtC, LqtR, Lpt
 
     def _get_shared_storage_cls(self, dtype, n_lat, alias_pt_on_rope):
+        # fused combine: [epoch, slot | claimed << 8, steal mask, mbarrier]; sits in the padding
+        # before the 128-B aligned sRed, so the smem footprint does not change
+        comb_words = 4 if self.fused_combine else 0
         align = self.buffer_align_bytes
         h = self.h
         tn = self.tile_n
@@ -176,6 +188,7 @@ class FlashAttentionMLADecodeSm100:
             mbar_stats: cute.struct.MemRange[Int64, 2 * nst]
             mbar_Q: cute.struct.MemRange[Int64, 1]
             tmem_holding: cute.struct.MemRange[Int32, 1]
+            sComb: cute.struct.MemRange[Int64, comb_words]
             sRed: cute.struct.Align[cute.struct.MemRange[Float32, nw * h], 128]
             sSmMax: cute.struct.Align[cute.struct.MemRange[Float32, h], 128]
             sSmSum: cute.struct.Align[cute.struct.MemRange[Float32, h], 128]
@@ -205,10 +218,14 @@ class FlashAttentionMLADecodeSm100:
         mSeqUsedK: Optional[cute.Tensor] = None,
         mTopkValidLen: Optional[cute.Tensor] = None,  # (total_q,)
         stream: cuda.CUstream = None,
+        mOFinal: Optional[cute.Tensor] = None,     # fused combine: (total_q, h, 512) 16-bit
+        mLSEFinal: Optional[cute.Tensor] = None,   # fused combine: (total_q, h) or None
+        mSem: Optional[cute.Tensor] = None,        # fused combine: (groups, S + 1) Int64
     ):
         assert not self.is_split_kv or mLSE is not None, (
             "split-KV needs the partial LSE tensor: flash_fwd_combine reduces on it"
         )
+        assert self.fused_combine == (mSem is not None and mOFinal is not None)
 
         dtype = mV.element_type
         assert dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN), (
@@ -241,6 +258,13 @@ class FlashAttentionMLADecodeSm100:
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=[0, 2, 1]))
             for mX in (mK, mV)
         ]
+        if const_expr(self.fused_combine):
+            mOFinal = cute.make_tensor(
+                mOFinal.iterator,
+                cute.make_layout(mOFinal.shape, stride=new_stride(mOFinal)),
+            )
+            # (total_q, h, dv) -> (total_q, dv, h), like the unsplit mO
+            mOFinal = cute.make_tensor(mOFinal.iterator, cute.select(mOFinal.layout, mode=[0, 2, 1]))
         # (total_q, topk) -> (topk, total_q)
         mIndexTopk = cute.make_tensor(
             mIndexTopk.iterator, cute.select(mIndexTopk.layout, mode=[1, 0])
@@ -276,6 +300,7 @@ class FlashAttentionMLADecodeSm100:
             mma_S, mma_O, LlatK, LlatMN, Lrope, LqtC, LqtR, Lpt,
             softmax_scale * LOG2_E,
             SharedStorage,
+            mOFinal, mLSEFinal, mSem,
         ).launch(
             grid=grid_dim,
             block=(self.num_threads, 1, 1),
@@ -308,6 +333,9 @@ class FlashAttentionMLADecodeSm100:
         Lpt: cute.ComposedLayout,
         softmax_scale_log2: Float32,
         SharedStorage: cutlass.Constexpr[Callable],
+        mOFinal: Optional[cute.Tensor],
+        mLSEFinal: Optional[cute.Tensor],
+        mSem: Optional[cute.Tensor],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -424,6 +452,10 @@ class FlashAttentionMLADecodeSm100:
         mbar_Q = storage.mbar_Q.data_ptr()
         if tidx == 0:
             cute.arch.mbarrier_init(mbar_Q, self.num_corr_threads)
+        if const_expr(self.fused_combine):
+            if tidx == 0:
+                # one-thread broadcast barrier of the fused combine (phase 0: ticket, 1: mask)
+                cute.arch.mbarrier_init(storage.sComb.data_ptr() + 3, 1)
 
         # ==== TMEM ==================================================================
         tmem_bar = pipeline.NamedBarrier(
@@ -495,10 +527,165 @@ class FlashAttentionMLADecodeSm100:
                 dtype, n_block_lo, num_n_blocks,
             )
 
+        if const_expr(self.fused_combine):
+            self._fused_combine(
+                mO, mLSE, mOFinal, mLSEFinal, mSem,
+                storage.sComb.get_tensor(cute.make_layout(4)),
+                tidx, warp_idx, head_kv, m_idx, hg_idx, mV.shape[2],
+            )
+
         # ==== TMEM teardown (all 512 threads) =======================================
         tmem.relinquish_alloc_permit()
         tmem_bar.arrive_and_wait()
         tmem.free(tmem_ptr)
+
+    # ============================================== fused split-KV combine (all warps)
+    @cute.jit
+    def _fused_combine(
+        self, mO, mLSE, mOFinal, mLSEFinal, mSem, sComb,
+        tidx, warp_idx, head_kv, m_idx, hg_idx, nheads_kv,
+    ):
+        """Reduce the S split partials of this CTA's (token, head group) in-kernel.
+
+        The group's partial O (h x 512 fp32 per split) is cut into S equal slices. After its own
+        partial is in gmem, every split CTA takes a ticket from the group counter; the ticket
+        number is the slice it owns. A CTA that is not last waits (bounded by
+        FUSED_COMBINE_WAIT_NS) until all S tickets are out, posts "claimed" for its slot and
+        reduces its slice, or on timeout posts "abandoned" and leaves. The last CTA reduces its
+        own slice, then reads the S-1 posts (each waiter is resident and decides within its
+        timeout) and reduces the abandoned slices. Nothing waits unboundedly, so the scheme is
+        correct even when a group's CTAs are not co-resident.
+
+        Words are never reset: each launch adds exactly S to the group counter, so
+        epoch = ticket // S + 1 numbers the launch; slot posts are 2 * epoch (claimed) or
+        2 * epoch + 1 (abandoned) and only grow.
+
+        Memory model (PTX ISA 9.3):
+          * the corr threads' partial O / LSE stores -> bar.sync on bar_corr, which
+            synchronizes (8.9.4 item 2) -> thread 0's ticket.
+          * ticket = atom.acq_rel.gpu on the counter: a release pattern (8.8) covering those
+            stores (causality is transitive, 8.9.5), and an acquire of every earlier ticket's
+            release (observation order through the RMW chain, 8.9.2 item 2; 8.9.4 item 4).
+          * waiter: ld.acquire.gpu reading the counter value epoch * S, written by the last
+            ticket, synchronizes with all S releases.
+          * thread 0 -> mbarrier.arrive (.release.cta) -> every thread's mbarrier wait (.acquire.cta)
+            -> its weak loads of the partials (causality order is transitive, 8.9.5).
+            All accesses are generic proxy to the same addresses (proxy-preserved, 8.9.5).
+          * slot posts carry no data: the last CTA's own acquire already covers all partials.
+        """
+        S = const_expr(self.num_splits)
+        h = const_expr(self.h)
+        head_base = head_kv * self.qhead_per_kvhead + hg_idx * h
+        gid = (m_idx * nheads_kv + head_kv) * self.num_head_groups + hg_idx
+        ctr_ptr = mSem[gid, None].iterator  # [0] ticket counter, [1 + slot] slot posts
+        # corr thread 0 (and later warp 0 of the last CTA) publishes through sComb and arrives
+        # on this mbarrier (arrive is .release.cta, the waits are .acquire.cta: PTX 9.3
+        # 9.7.14.16.16 / 9.7.14.16.19), so all 512 threads read sComb after the write
+        mbar_comb = sComb.iterator + 3
+
+        if warp_idx >= self.corr_warp_lo and warp_idx < self.mma_warp_id:
+            ctid = tidx - self.corr_tid_lo
+            # every corr thread's partial O and LSE stores precede the ticket
+            pipeline.NamedBarrier(
+                barrier_id=self.bar_id_corr, num_threads=self.num_corr_threads
+            ).arrive_and_wait()
+            if ctid == 0:
+                ticket = cute.arch.atomic_add(ctr_ptr, Int64(1), sem="acq_rel", scope="gpu")
+                epoch = ticket // S + 1
+                slot = ticket - (epoch - 1) * S
+                claimed = Int64(1)
+                if slot != S - 1:
+                    target = epoch * S
+                    t_start = cute.arch.globaltimer()
+                    seen = cute.arch.load(ctr_ptr, Int64, sem="acquire", scope="gpu")
+                    while seen < target and cute.arch.globaltimer() - t_start < FUSED_COMBINE_WAIT_NS:
+                        seen = cute.arch.load(ctr_ptr, Int64, sem="acquire", scope="gpu")
+                    claimed = Int64(1) if seen >= target else Int64(0)
+                    cute.arch.store(
+                        ctr_ptr + 1 + Int32(slot), 2 * epoch + 1 - claimed,
+                        sem="relaxed", scope="gpu",
+                    )
+                sComb[0] = epoch
+                sComb[1] = slot | (claimed << 8)
+                cute.arch.mbarrier_arrive(mbar_comb)
+        cute.arch.mbarrier_wait(mbar_comb, Int32(0))
+        epoch = sComb[0]
+        packed = Int32(sComb[1])
+        slot = packed & 0xFF
+        if (packed >> 8) != 0:
+            self._combine_slice(mO, mLSE, mOFinal, mLSEFinal, m_idx, head_base, slot, tidx)
+        if slot == S - 1:
+            # last CTA: collect the waiters' posts, then reduce every abandoned slice
+            if warp_idx == 0:
+                abandoned = False
+                if tidx < S - 1:
+                    post = cute.arch.load(ctr_ptr + 1 + tidx, Int64, sem="relaxed", scope="gpu")
+                    while post < 2 * epoch:
+                        post = cute.arch.load(ctr_ptr + 1 + tidx, Int64, sem="relaxed", scope="gpu")
+                    abandoned = post == 2 * epoch + 1
+                mask = cute.arch.vote_ballot_sync(abandoned)
+                if tidx == 0:
+                    sComb[2] = Int64(mask)
+                    cute.arch.mbarrier_arrive(mbar_comb)
+            cute.arch.mbarrier_wait(mbar_comb, Int32(1))
+            mask = Int32(sComb[2])
+            if mask != 0:
+                for sl in cutlass.range(S - 1, unroll=1):
+                    if (mask >> sl) & 1 != 0:
+                        self._combine_slice(
+                            mO, mLSE, mOFinal, mLSEFinal, m_idx, head_base, sl, tidx
+                        )
+
+    @cute.jit
+    def _combine_slice(self, mO, mLSE, mOFinal, mLSEFinal, m_idx, head_base, sl, tidx):
+        """out = sum_s exp(lse_s - lse) * O_s over one slice (FlashAttentionForwardCombine math).
+
+        All loads are issued before any arithmetic so each thread waits one L2 round trip.
+        """
+        S = const_expr(self.num_splits)
+        slice_vecs = const_expr(self.h * self.hdimv // (4 * S))  # 4-float vectors per slice
+        nvec = const_expr(cute.ceil_div(slice_vecs, self.num_threads))
+        full = const_expr(slice_vecs % self.num_threads == 0)
+        rO = cute.make_rmem_tensor((4, S, nvec), Float32)
+        rL = cute.make_rmem_tensor((S, nvec), Float32)
+        for k in cutlass.range_constexpr(nvec):
+            i = tidx + k * self.num_threads
+            e = (sl * slice_vecs + i) * 4
+            hh = head_base + e // self.hdimv
+            dv = e % self.hdimv
+            if const_expr(full) or i < slice_vecs:
+                for s in cutlass.range_constexpr(S):
+                    rL[s, k] = mLSE[m_idx, hh, s]
+                    cute.autovec_copy(
+                        cute.local_tile(mO[m_idx, None, hh, s], (4,), (dv // 4,)), rO[None, s, k]
+                    )
+        for k in cutlass.range_constexpr(nvec):
+            i = tidx + k * self.num_threads
+            e = (sl * slice_vecs + i) * 4
+            hh = head_base + e // self.hdimv
+            dv = e % self.hdimv
+            if const_expr(full) or i < slice_vecs:
+                lse_max = rL[0, k]
+                for s in cutlass.range_constexpr(1, S):
+                    lse_max = cute.arch.fmax(lse_max, rL[s, k])
+                lse_max_cur = lse_max if lse_max != -Float32.inf else Float32(0.0)
+                lse_sum = Float32(0.0)
+                for s in cutlass.range_constexpr(S):
+                    rL[s, k] = cute.math.exp2(rL[s, k] * LOG2_E - lse_max_cur * LOG2_E, fastmath=True)
+                    lse_sum += rL[s, k]
+                bad = lse_sum == 0.0 or lse_sum != lse_sum
+                inv = Float32(0.0) if bad else 1.0 / lse_sum
+                # every split partial is finite (an empty row stores O = 0 with lse = -inf, so
+                # its weight is exactly 0), so no per-split skip is needed
+                acc = cute.make_rmem_tensor(4, Float32)
+                acc.fill(0.0)
+                for s in cutlass.range_constexpr(S):
+                    acc.store(acc.load() + (rL[s, k] * inv) * rO[None, s, k].load())
+                gOut = cute.local_tile(mOFinal[m_idx, None, hh], (4,), (dv // 4,))
+                gOut.store(acc.load().to(mOFinal.element_type))
+                if const_expr(mLSEFinal is not None):
+                    if dv == 0:
+                        mLSEFinal[m_idx, hh] = cute.math.log(lse_sum, fastmath=True) + lse_max
 
     # ================================================================ gather warps
     @cute.jit
