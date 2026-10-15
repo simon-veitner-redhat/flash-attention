@@ -35,8 +35,9 @@ _RING = {8: (6, False), 16: (6, True), 32: (5, False)}
 _RING_FP8_MMA = {8: 12, 16: 12, 32: 10}
 # The O^T MMA's B is [P_hi | P_lo]^T in e4m3, stacked along N (N = 2h):
 #   P_hi = e4m3(P * 2^8), P_lo = e4m3((P * 2^8 - P_hi) * 2^4),
-#   O = (O_hi + 2^-4 * O_lo) * 2^-8 / rowsum  (relative error ~2^-8, like a bf16 P).
+#   O = (O_hi + 2^-4 * O_lo) / rowsum(P * 2^8)  (relative error ~2^-8, like a bf16 P).
 FP8_P_SCALE = 256.0
+FP8_P_SCALE_LOG2 = 8.0  # folded into the exp2 offset: the softmax produces P * 2^8 directly
 FP8_P_LO_SCALE = 16.0
 
 
@@ -828,6 +829,10 @@ class FlashAttentionMLADecodeSm100:
             row_max = sSmMax[cS_t2r[i][1]]
             safe_max = row_max if row_max != -Float32.inf else Float32(0.0)
             bias = -safe_max * softmax_scale_log2
+            if const_expr(self.fp8_mma):
+                # fp8 P^T operand: exp2(... + 8) = P * 2^8, exact; the row sum carries the 2^8
+                # too, so it cancels in O / rowsum and the LSE subtracts it
+                bias = bias + FP8_P_SCALE_LOG2
             tSrP[i] = cute.math.exp2(tSrS[i] * softmax_scale_log2 + bias, fastmath=True)
 
         # ---- row sum per head across the 128 lanes -------------------------------
@@ -845,14 +850,11 @@ class FlashAttentionMLADecodeSm100:
                 pt_nd[cS_t2r[i][1], key_row] = tSrP[i].to(sPt.element_type)
         else:
             # this key's row of [P_hi | P_lo]^T: 2h contiguous e4m3 (heads, then heads)
-            rX = cute.make_rmem_tensor((h,), Float32)
-            for i in cutlass.range_constexpr(h):
-                rX[i] = tSrP[i] * FP8_P_SCALE
-            rHi = cute.make_rmem_tensor((h,), cutlass.Float8E4M3FN)
-            rHi.store(rX.load().to(cutlass.Float8E4M3FN))
+            rHi = cute.make_rmem_tensor(tSrP.shape, cutlass.Float8E4M3FN)
+            rHi.store(tSrP.load().to(cutlass.Float8E4M3FN))
             rRow = cute.make_rmem_tensor((2 * h,), cutlass.Float8E4M3FN)
-            rLo = cute.make_rmem_tensor((h,), cutlass.Float8E4M3FN)
-            rLo.store(((rX.load() - rHi.load().to(Float32)) * FP8_P_LO_SCALE).to(
+            rLo = cute.make_rmem_tensor(tSrP.shape, cutlass.Float8E4M3FN)
+            rLo.store(((tSrP.load() - rHi.load().to(Float32)) * FP8_P_LO_SCALE).to(
                 cutlass.Float8E4M3FN
             ))
             for i in cutlass.range_constexpr(h):
@@ -879,6 +881,55 @@ class FlashAttentionMLADecodeSm100:
         return cs_S, ps_P, ps_st
 
     # =========================================== correction + Q^T load + epilogue
+    def _qt_fp8_units(self):
+        """e4m3 Q^T is K-major like q in gmem (each head's 576 dims contiguous): it is moved in
+        16 B units, 36 per head (32 latent + 4 rope), unit u = ctid + n_corr * it."""
+        upr = self.hdim_total // 16
+        return upr, (upr * self.h + self.num_corr_threads - 1) // self.num_corr_threads
+
+    @cute.jit
+    def _qt_fp8_load(self, mQ, mQv, rQ, ctid, m_idx, head_base):
+        """LDG.128 this thread's Q^T units into rQ[16, it]."""
+        upr, n_it = self._qt_fp8_units()
+        lat_u = self.hdimv // 16
+        gQv = mQv[m_idx, None, None]  # (512, h_total)
+        gQr = mQ[m_idx, None, None]  # (64,  h_total)
+        for it in cutlass.range_constexpr(n_it):
+            u = ctid + self.num_corr_threads * it
+            if const_expr((it + 1) * self.num_corr_threads <= upr * self.h) or u < upr * self.h:
+                n = u // upr
+                k16 = u % upr
+                addr = utils.elem_pointer(gQr, (16 * (k16 - lat_u), head_base + n)).toint()
+                if k16 < lat_u:
+                    addr = utils.elem_pointer(gQv, (16 * k16, head_base + n)).toint()
+                src = cute.make_tensor(
+                    cute.make_ptr(rQ.element_type, addr, cute.AddressSpace.gmem, assumed_align=16),
+                    cute.make_layout((16,)),
+                )
+                cute.autovec_copy(src, rQ[None, it])
+
+    @cute.jit
+    def _qt_fp8_store(self, rQ, sQtC, sQtR, qtc_layout, qtr_layout, ctid):
+        upr, n_it = self._qt_fp8_units()
+        lat_u = self.hdimv // 16
+        cu = self.dv_chunk // 16
+        for it in cutlass.range_constexpr(n_it):
+            u = ctid + self.num_corr_threads * it
+            if const_expr((it + 1) * self.num_corr_threads <= upr * self.h) or u < upr * self.h:
+                n = u // upr
+                k16 = u % upr
+                if k16 < lat_u:
+                    c = k16 // cu
+                    dst = cute.zipped_divide(
+                        cute.composition(sQtC[None, None, None, c], qtc_layout), (1, 16)
+                    )
+                    cute.autovec_copy(rQ[None, it], dst[(0, None), (n, k16 % cu)])
+                else:
+                    dst = cute.zipped_divide(
+                        cute.composition(sQtR[None, None, None, 0], qtr_layout), (1, 16)
+                    )
+                    cute.autovec_copy(rQ[None, it], dst[(0, None), (n, k16 - lat_u)])
+
     @cute.jit
     def corr_epilogue_loop(
         self, mQ, mQv, mO, mLSE, mma_O, accO, sQtC, sQtR,
@@ -909,45 +960,10 @@ class FlashAttentionMLADecodeSm100:
                 for n in cutlass.range_constexpr(h):
                     qt_rope[n, ctid] = gQr[ctid, head_base + n]
         else:
-            # e4m3 Q^T is K-major (each head's 576 dims contiguous), like q in gmem: copy it in
-            # 16 B units, 36 per head (32 latent + 4 rope), LDG.128 -> STS.128
-            upr = self.hdim_total // 16  # e4m3: one byte per dim
-            lat_u = self.hdimv // 16
-            for it in cutlass.range_constexpr((upr * h + self.num_corr_threads - 1) // self.num_corr_threads):
-                u = ctid + self.num_corr_threads * it
-                if const_expr((it + 1) * self.num_corr_threads <= upr * h) or u < upr * h:
-                    n = u // upr
-                    k16 = u % upr
-                    r = cute.make_rmem_tensor((16,), sQtC.element_type)
-                    if k16 < lat_u:
-                        src = cute.make_tensor(
-                            cute.make_ptr(
-                                sQtC.element_type,
-                                utils.elem_pointer(gQv, (16 * k16, head_base + n)).toint(),
-                                cute.AddressSpace.gmem, assumed_align=16,
-                            ),
-                            cute.make_layout((16,)),
-                        )
-                        cute.autovec_copy(src, r)
-                        c = k16 // (self.dv_chunk // 16)
-                        dst = cute.zipped_divide(
-                            cute.composition(sQtC[None, None, None, c], qtc_layout), (1, 16)
-                        )
-                        cute.autovec_copy(r, dst[(0, None), (n, k16 % (self.dv_chunk // 16))])
-                    else:
-                        src = cute.make_tensor(
-                            cute.make_ptr(
-                                sQtC.element_type,
-                                utils.elem_pointer(gQr, (16 * (k16 - lat_u), head_base + n)).toint(),
-                                cute.AddressSpace.gmem, assumed_align=16,
-                            ),
-                            cute.make_layout((16,)),
-                        )
-                        cute.autovec_copy(src, r)
-                        dst = cute.zipped_divide(
-                            cute.composition(sQtR[None, None, None, 0], qtr_layout), (1, 16)
-                        )
-                        cute.autovec_copy(r, dst[(0, None), (n, k16 - lat_u)])
+            # e4m3 Q^T: 16 B units, LDG.128 -> STS.128
+            rQ = cute.make_rmem_tensor((16, self._qt_fp8_units()[1]), mQv.element_type)
+            self._qt_fp8_load(mQ, mQv, rQ, ctid, m_idx, head_base)
+            self._qt_fp8_store(rQ, sQtC, sQtR, qtc_layout, qtr_layout, ctid)
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.mbarrier_arrive(mbar_Q)
 
@@ -1003,11 +1019,20 @@ class FlashAttentionMLADecodeSm100:
             bad = rs == 0.0 or rs != rs
             sInv[ctid] = cute.arch.rcp_approx(rs if not bad else Float32(1.0))
             if const_expr(mLSE is not None):
-                lse = (
-                    (sSmMax[ctid] * softmax_scale_log2 + cute.math.log2(rs, fastmath=True)) * LN2
-                    if not bad
-                    else -Float32.inf
-                )
+                if const_expr(not self.fp8_mma):
+                    lse = (
+                        (sSmMax[ctid] * softmax_scale_log2 + cute.math.log2(rs, fastmath=True)) * LN2
+                        if not bad
+                        else -Float32.inf
+                    )
+                else:
+                    # the row sum is of P * 2^8
+                    lse = (
+                        (sSmMax[ctid] * softmax_scale_log2 + cute.math.log2(rs, fastmath=True)
+                         - FP8_P_SCALE_LOG2) * LN2
+                        if not bad
+                        else -Float32.inf
+                    )
                 if const_expr(self.is_split_kv):
                     mLSE[m_idx, head_base + ctid, split_idx] = lse
                 else:
@@ -1022,14 +1047,12 @@ class FlashAttentionMLADecodeSm100:
                 cute.copy(thr_ldO, tOaccO_ld[j], tOrO)
                 cute.arch.fence_view_async_tmem_load()
             else:
-                # O = (O_hi + 2^-4 O_lo) * 2^-8: undo the P operand scales (powers of two)
+                # O = O_hi + 2^-4 O_lo; the 2^8 of P cancels against the row sum
                 cute.copy(thr_ldO, tOaccO_ld[2 * j], tOrO)
                 cute.copy(thr_ldO, tOaccO_ld[2 * j + 1], tOrO_lo)
                 cute.arch.fence_view_async_tmem_load()
                 for i in cutlass.range_constexpr(h):
-                    tOrO[i] = (tOrO[i] + tOrO_lo[i] * (1.0 / FP8_P_LO_SCALE)) * (
-                        1.0 / FP8_P_SCALE
-                    )
+                    tOrO[i] = tOrO[i] + tOrO_lo[i] * (1.0 / FP8_P_LO_SCALE)
             for i in cutlass.range_constexpr(h):
                 dv = j * self.dv_chunk + cO_t2r[i][0]
                 hh = cO_t2r[i][1]
