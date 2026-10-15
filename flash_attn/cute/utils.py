@@ -1075,4 +1075,3 @@ def cvt_e4m3x4_to_16bit(
         cutlass.Int32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
         cutlass.Int32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
     )
-

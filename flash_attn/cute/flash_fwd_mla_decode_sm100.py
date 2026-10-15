@@ -118,7 +118,7 @@ class FlashAttentionMLADecodeSm100:
         # fp8 staged gather only: warps 12-15 cp.async into the staging ring and warps 9-11
         # (idle in the 16-bit kernel) convert it into the bf16 stages
         self.stg_load_warp_lo = self.gather_warp_lo
-        self.num_stg_load_threads = (16 - self.stg_load_warp_lo) * 32
+        self.num_stg_load_threads = (self.num_threads // 32 - self.stg_load_warp_lo) * 32
         self.stg_load_tid_lo = self.stg_load_warp_lo * 32
         self.conv_warp_lo = self.mma_warp_id + 1
         self.num_conv_threads = (self.stg_load_warp_lo - self.conv_warp_lo) * 32
@@ -258,6 +258,7 @@ class FlashAttentionMLADecodeSm100:
             # the MMA, smem and P^T dtype: a 16-bit Q's, or bf16 for an e4m3 Q (exact widening);
             # only the Q^T fill and the gather read fp8
             dtype = self._mma_dtype_fp8_kv(mQv)
+            self.dtype_mma = dtype
             self.fp8_mma = dtype == cutlass.Float8E4M3FN
             self.fp8_staged = not self.fp8_mma
             assert mQ.element_type == mQv.element_type, "q and qv must share a dtype"
@@ -334,7 +335,8 @@ class FlashAttentionMLADecodeSm100:
             smem=smem_bytes,
             stream=stream,
             # .minnctapersm 1 gives ptxas the entry register count that setmaxnreg needs
-            **({"min_blocks_per_mp": 1} if const_expr(self.fp8_staged) else {}),
+            # (0, the default, emits no directive)
+            min_blocks_per_mp=1 if const_expr(self.fp8_staged) else 0,
         )
 
     # ------------------------------------------------------------------ kernel
@@ -366,9 +368,7 @@ class FlashAttentionMLADecodeSm100:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, head_kv, _ = cute.arch.block_idx()
-        dtype = (
-            mV.element_type if const_expr(self.kv_format is None) else self._mma_dtype_fp8_kv(mQv)
-        )
+        dtype = mV.element_type if const_expr(self.kv_format is None) else self.dtype_mma
         h = const_expr(self.h)
 
         # ==== grid decode: x = (token, KV split, head group), head group fastest =====
@@ -669,6 +669,8 @@ class FlashAttentionMLADecodeSm100:
     # slot's release.
 
     FP8_LAT_UNITS = 2  # 16 B units per loader thread per row of a 128-col latent chunk
+    # the staged thread maps (FP8_STG_CHUNK_BYTES, the sStg strides, FP8_LAT_UNITS, the
+    # converter's unit math) assume 128 x 128 B chunks of 8 units and 4 rows per thread slot
     FP8_CONV_BATCH = 3  # units a converter thread LDSes before their STS
 
     @cute.jit
@@ -678,6 +680,7 @@ class FlashAttentionMLADecodeSm100:
         n_block_lo, num_n_blocks,
     ):
         tn, dvc = self.tile_n, self.dv_chunk
+        assert tn == dvc == 128 and (tn // (self.num_stg_load_threads // 4)) % 4 == 0
         ltid = tidx - self.stg_load_tid_lo
         n_slots = self.num_stg_load_threads // 4  # 4 threads per row slot
         nr = tn // n_slots  # rows per thread: slot + n_slots * i

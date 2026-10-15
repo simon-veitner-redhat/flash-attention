@@ -57,9 +57,26 @@ def run_decode(q, qv, k, v, cu_seqlens_q, idx, valid_len, return_lse=True):
     )
 
 
+# fp8 flavors of a decode call: None (16-bit q/kv), "kv" (e4m3 K/V, 16-bit q: staged
+# conversion), "kvq" (e4m3 K/V and q: kind::f8f6f4 MMAs)
+FP8_FLAVORS = [None, "kv", "kvq"]
+
+
+def to_fp8(flavor, q, qv, kv):
+    """Kernel inputs for an fp8 flavor, plus the 16-bit references they upcast to exactly."""
+    if flavor is None:
+        return (q, qv, kv[..., 512:], kv[..., :512]), (q, qv, kv)
+    kv8 = kv.to(torch.float8_e4m3fn)
+    kv_ref = kv8.to(kv.dtype)
+    if flavor == "kvq":
+        q8, qv8 = q.to(torch.float8_e4m3fn), qv.to(torch.float8_e4m3fn)
+        return (q8, qv8, kv8[..., 512:], kv8[..., :512]), (q8.to(q.dtype), qv8.to(qv.dtype), kv_ref)
+    return (q, qv, kv8[..., 512:], kv8[..., :512]), (q, qv, kv_ref)
+
+
 def check(
     q_lens, counts, num_heads=16, split_views=True, seed=0,
-    dtype=torch.bfloat16, use_valid_length=True, pad=-1,
+    dtype=torch.bfloat16, use_valid_length=True, pad=-1, fp8=None,
 ):
     device = "cuda"
     cu_seqlens_q = flat_kv.cu_seqlens_from(q_lens, device)
@@ -71,9 +88,10 @@ def check(
     idx, valid_len = flat_kv.make_indices(
         counts, NUM_KV_ROWS, device, seed=seed + 2, pad=pad,
     )
+    (q_in, qv_in, k, v), (q, qv, kv) = to_fp8(fp8, q, qv, kv)
 
     out, lse = run_decode(
-        q, qv, k, v, cu_seqlens_q, idx, valid_len if use_valid_length else None,
+        q_in, qv_in, k, v, cu_seqlens_q, idx, valid_len if use_valid_length else None,
     )
     out_ref, lse_ref = flat_kv.ref_sparse_mla(q, qv, kv, idx, counts)
     out_pt, _ = flat_kv.ref_sparse_mla(q, qv, kv, idx, counts, upcast=False)
@@ -105,10 +123,11 @@ def test_decode_without_valid_length(dtype, num_heads):
     check([1] * 9, ragged_counts(9), num_heads=num_heads, dtype=dtype, use_valid_length=False)
 
 
+@pytest.mark.parametrize("fp8", FP8_FLAVORS)
 @pytest.mark.parametrize("pad", [-1, -2147483648, 1 << 20])
-def test_decode_out_of_range_padding_sentinels(pad):
+def test_decode_out_of_range_padding_sentinels(pad, fp8):
     """The gather forms a gmem pointer from the raw index, so any sentinel must be predicated."""
-    check([1] * 9, ragged_counts(9), pad=pad, seed=51)
+    check([1] * 9, ragged_counts(9), pad=pad, seed=51, fp8=fp8)
 
 
 def lse_inputs(total_q, num_heads, seed):
@@ -175,8 +194,9 @@ def test_decode_preallocated_lse(total_q):
     torch.testing.assert_close(out, out_ref, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("fp8", FP8_FLAVORS)
 @pytest.mark.parametrize("kv_heads", [[1, 2, 1], [2, 1, 2]])
-def test_decode_cache_reuse_and_kv_offsets(kv_heads):
+def test_decode_cache_reuse_and_kv_offsets(kv_heads, fp8):
     """Changing the dynamic KV-head count must update grid Y on a cache hit."""
     from flash_attn.cute.interface import _flash_attn_fwd
 
@@ -190,9 +210,10 @@ def test_decode_cache_reuse_and_kv_offsets(kv_heads):
     for heads_k in kv_heads:
         q, qv = flat_kv.make_q(tokens, device, num_heads=heads_k * head_ratio)
         kv = torch.randn(tokens * rows_per_req, heads_k, 576, device=device, dtype=q.dtype)
+        (q_in, qv_in, k_in, v_in), (q, qv, kv) = to_fp8(fp8, q, qv, kv)
         # unsplit grids (one n-block): this is the LSE check of the 2-D store at head_base != 0
         out, lse = flash_attn_varlen_func(
-            q, kv[..., 512:], kv[..., :512], qv=qv,
+            q_in, k_in, v_in, qv=qv_in,
             cu_seqlens_q=cuq, cu_seqlens_k=cuk,
             max_seqlen_q=1, max_seqlen_k=rows_per_req,
             gather_kv_indices=idx, gather_kv_valid_length=valid,
@@ -208,7 +229,7 @@ def test_decode_cache_reuse_and_kv_offsets(kv_heads):
                     kv_row, idx[row:row + 1], counts[row:row + 1],
                 )
                 torch.testing.assert_close(
-                    out[row:row + 1, head_slice], ref, atol=0.015, rtol=0.015,
+                    out[row:row + 1, head_slice].to(ref.dtype), ref, atol=0.015, rtol=0.015,
                 )
                 # counts[1] == 0: -inf lse and zero output on the empty row.
                 torch.testing.assert_close(
@@ -222,10 +243,22 @@ def test_decode_cache_reuse_and_kv_offsets(kv_heads):
 @pytest.mark.parametrize("use_valid_length", [False, True])
 def test_decode_leading_empty_block(dtype, num_heads, tokens, topk, use_valid_length):
     """An empty first block must not clamp subsequent negative score maxima to zero."""
+    leading_empty_block(dtype, num_heads, tokens, topk, use_valid_length, None)
+
+
+@pytest.mark.parametrize("fp8", ["kv", "kvq"])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+@pytest.mark.parametrize("tokens,topk", [(1, 2048), (148, 256)])
+def test_decode_leading_empty_block_fp8(fp8, num_heads, tokens, topk):
+    leading_empty_block(torch.bfloat16, num_heads, tokens, topk, True, fp8)
+
+
+def leading_empty_block(dtype, num_heads, tokens, topk, use_valid_length, fp8):
     q = torch.zeros(tokens, num_heads, 64, device="cuda", dtype=dtype)
     qv = torch.full((tokens, num_heads, 512), -10, device="cuda", dtype=dtype)
-    k = torch.zeros(1, 1, 64, device="cuda", dtype=dtype)
-    v = torch.ones(1, 1, 512, device="cuda", dtype=dtype)
+    kv = torch.zeros(1, 1, 576, device="cuda", dtype=dtype)
+    kv[..., :512] = 1
+    (q, qv, k, v), _ = to_fp8(fp8, q, qv, kv)
     idx = torch.full((tokens, topk), -1, device="cuda", dtype=torch.int32)
     idx[:, TILE_N:2 * TILE_N] = 0
     valid = torch.full((tokens,), 2 * TILE_N, device="cuda", dtype=torch.int32)
@@ -239,7 +272,7 @@ def test_decode_leading_empty_block(dtype, num_heads, tokens, topk, use_valid_le
         gather_kv_valid_length=valid if use_valid_length else None,
         softmax_scale=SOFTMAX_SCALE,
     )[0]
-    torch.testing.assert_close(out, torch.ones_like(out), atol=0.002, rtol=0)
+    torch.testing.assert_close(out.float(), torch.ones_like(out, dtype=torch.float32), atol=0.002, rtol=0)
 
 
 def fp8_flat_kv(num_rows, device, seed, poison_rows=4):
