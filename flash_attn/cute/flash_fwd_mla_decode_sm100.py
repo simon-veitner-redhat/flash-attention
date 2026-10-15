@@ -1118,7 +1118,7 @@ class FlashAttentionMLADecodeSm100:
         for i in cutlass.range_constexpr(h):
             if const_expr(self.fp8_mma):
                 # one redux.sync.max.f32 per value; the same max as the fmax butterfly
-                tSrP[i] = utils.redux_max_f32(tSrS[i])
+                tSrP[i] = cute.arch.warp_redux_sync(tSrS[i], "fmax")
             else:
                 tSrP[i] = warp_reduce(tSrS[i], cute.arch.fmax)
         if lane_idx == 0:

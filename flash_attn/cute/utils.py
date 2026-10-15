@@ -1047,19 +1047,3 @@ def as_shhb_tensor(
             ),
         ),
     )
-
-
-@dsl_user_op
-def redux_max_f32(x: Float32, *, loc=None, ip=None) -> Float32:
-    """Max over the full warp (redux.sync.max.f32, sm_100a); every lane gets the result."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(x).ir_value(loc=loc, ip=ip)],
-            "redux.sync.max.f32 $0, $1, 0xffffffff;",
-            "=f,f",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
