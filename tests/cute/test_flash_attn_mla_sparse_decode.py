@@ -332,7 +332,8 @@ def test_decode_fp8_q_n_blocks(decode_route, total_q, topk, lead, splits, n_bloc
 @pytest.mark.parametrize("num_heads", [8, 16, 32])
 def test_decode_fp8_q_peaked_softmax(num_heads):
     """e4m3 q under a peaked softmax (logits 0, -1, -2, -3, the rest -20): the hi + lo P^T
-    terms keep every head's output within ~2^-8, which a global relL2 could hide."""
+    terms keep every head's output within 2^-8 (measured <= 2.6e-3 at h 8/16/32 on B200),
+    which a global relL2 could hide."""
     device = "cuda"
     total_q = NUM_KV_ROWS // TOPK  # disjoint rows, so each row's logit is per token
     kv8, _, _ = fp8_flat_kv(NUM_KV_ROWS, device, seed=66)
@@ -348,5 +349,5 @@ def test_decode_fp8_q_peaked_softmax(num_heads):
         q, qv.to(torch.float8_e4m3fn), kv8, idx, torch.full((total_q,), TOPK, device=device).int()
     )
     err = (out8.float() - out16.float()).abs().amax(-1) / out16.float().abs().amax(-1)
-    assert err.max() < 1e-2, f"per-head max error {err.max():.2e}"
+    assert err.max() < 2.0**-8, f"per-head max error {err.max():.2e}"
     torch.testing.assert_close(lse8, lse16, atol=1e-4, rtol=0)
