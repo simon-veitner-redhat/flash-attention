@@ -19,6 +19,7 @@ from cutlass.cute.nvgpu.tcgen05 import CtaGroup, OperandMajorMode
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
+from flash_attn.cute import utils
 from flash_attn.cute.utils import get_batch_from_cu_tensor, warp_reduce
 
 
@@ -898,14 +899,55 @@ class FlashAttentionMLADecodeSm100:
         qtr_layout = cute.make_ordered_layout((h, self.hdim_rope), order=(0, 1))
         gQv = mQv[m_idx, None, None]  # (512, h_total)
         gQr = mQ[m_idx, None, None]  # (64,  h_total)
-        for c in cutlass.range_constexpr(self.num_chunks):
-            qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
-            for n in cutlass.range_constexpr(h):
-                qt_nd[n, ctid] = gQv[c * self.dv_chunk + ctid, head_base + n]
-        qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
-        if ctid < self.hdim_rope:
-            for n in cutlass.range_constexpr(h):
-                qt_rope[n, ctid] = gQr[ctid, head_base + n]
+        if const_expr(not self.fp8_mma):
+            for c in cutlass.range_constexpr(self.num_chunks):
+                qt_nd = cute.composition(sQtC[None, None, None, c], qtc_layout)
+                for n in cutlass.range_constexpr(h):
+                    qt_nd[n, ctid] = gQv[c * self.dv_chunk + ctid, head_base + n]
+            qt_rope = cute.composition(sQtR[None, None, None, 0], qtr_layout)
+            if ctid < self.hdim_rope:
+                for n in cutlass.range_constexpr(h):
+                    qt_rope[n, ctid] = gQr[ctid, head_base + n]
+        else:
+            # e4m3 Q^T is K-major (each head's 576 dims contiguous), like q in gmem: copy it in
+            # 16 B units, 36 per head (32 latent + 4 rope), LDG.128 -> STS.128
+            upr = self.hdim_total // 16  # e4m3: one byte per dim
+            lat_u = self.hdimv // 16
+            for it in cutlass.range_constexpr((upr * h + self.num_corr_threads - 1) // self.num_corr_threads):
+                u = ctid + self.num_corr_threads * it
+                if const_expr((it + 1) * self.num_corr_threads <= upr * h) or u < upr * h:
+                    n = u // upr
+                    k16 = u % upr
+                    r = cute.make_rmem_tensor((16,), sQtC.element_type)
+                    if k16 < lat_u:
+                        src = cute.make_tensor(
+                            cute.make_ptr(
+                                sQtC.element_type,
+                                utils.elem_pointer(gQv, (16 * k16, head_base + n)).toint(),
+                                cute.AddressSpace.gmem, assumed_align=16,
+                            ),
+                            cute.make_layout((16,)),
+                        )
+                        cute.autovec_copy(src, r)
+                        c = k16 // (self.dv_chunk // 16)
+                        dst = cute.zipped_divide(
+                            cute.composition(sQtC[None, None, None, c], qtc_layout), (1, 16)
+                        )
+                        cute.autovec_copy(r, dst[(0, None), (n, k16 % (self.dv_chunk // 16))])
+                    else:
+                        src = cute.make_tensor(
+                            cute.make_ptr(
+                                sQtC.element_type,
+                                utils.elem_pointer(gQr, (16 * (k16 - lat_u), head_base + n)).toint(),
+                                cute.AddressSpace.gmem, assumed_align=16,
+                            ),
+                            cute.make_layout((16,)),
+                        )
+                        cute.autovec_copy(src, r)
+                        dst = cute.zipped_divide(
+                            cute.composition(sQtR[None, None, None, 0], qtr_layout), (1, 16)
+                        )
+                        cute.autovec_copy(r, dst[(0, None), (n, k16 - lat_u)])
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.mbarrier_arrive(mbar_Q)
 
