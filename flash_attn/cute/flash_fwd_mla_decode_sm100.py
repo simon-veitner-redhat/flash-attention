@@ -186,7 +186,8 @@ class FlashAttentionMLADecodeSm100:
             mbar_P: cute.struct.MemRange[Int64, 2 * self.n_sp]
             mbar_O: cute.struct.MemRange[Int64, 2]
             mbar_stats: cute.struct.MemRange[Int64, 2 * nst]
-            mbar_Q: cute.struct.MemRange[Int64, 1]
+            # fp8_mma: [1] = the softmax's final row sums are written (stats publish early)
+            mbar_Q: cute.struct.MemRange[Int64, 2 if self.fp8_mma else 1]
             tmem_holding: cute.struct.MemRange[Int32, 1]
             sComb: cute.struct.MemRange[Int64, comb_words]
             sRed: cute.struct.Align[cute.struct.MemRange[Float32, nw * h], 128]
@@ -464,8 +465,13 @@ class FlashAttentionMLADecodeSm100:
         )
 
         mbar_Q = storage.mbar_Q.data_ptr()
+        mbar_sum = None
         if tidx == 0:
             cute.arch.mbarrier_init(mbar_Q, self.num_corr_threads)
+        if const_expr(self.fp8_mma):
+            mbar_sum = mbar_Q + 1
+            if tidx == 0:
+                cute.arch.mbarrier_init(mbar_sum, self.num_softmax_threads)
         if const_expr(self.fused_combine):
             if tidx == 0:
                 # one-thread broadcast barrier of the fused combine (phase 0: ticket, 1: mask)
@@ -520,14 +526,14 @@ class FlashAttentionMLADecodeSm100:
             self.softmax_loop(
                 mIndexTopk, mma_S, accS, sRed, sSmMax, sSmSum, sScale, sPt,
                 pl_S, pl_P, pl_stats, tidx, warp_idx, m_idx, seqlen_k_limit,
-                softmax_scale_log2, n_block_lo, num_n_blocks,
+                softmax_scale_log2, n_block_lo, num_n_blocks, mbar_sum,
             )
         elif warp_idx < self.mma_warp_id:
             self.corr_epilogue_loop(
                 mQ, mQv, mO, mLSE, mma_O_acc, accO, sQtC, sQtR,
                 sScale, sSmMax, sSmSum, sInv, pl_O, pl_stats, mbar_Q,
                 tidx, head_kv, m_idx, hg_idx, split_idx,
-                softmax_scale_log2, num_n_blocks,
+                softmax_scale_log2, num_n_blocks, mbar_sum,
             )
         elif warp_idx == self.mma_warp_id:
             self.mma_loop(
@@ -912,7 +918,7 @@ class FlashAttentionMLADecodeSm100:
     def softmax_loop(
         self, mIndexTopk, mma_S, accS, sRed, sSmMax, sSmSum, sScale, sPt,
         pl_S, pl_P, pl_stats, tidx, warp_idx, m_idx, seqlen_k_limit,
-        softmax_scale_log2, n_block_lo, num_n_blocks,
+        softmax_scale_log2, n_block_lo, num_n_blocks, mbar_sum=None,
     ):
         h = const_expr(self.h)
         lane_idx = cute.arch.lane_idx()
@@ -954,6 +960,9 @@ class FlashAttentionMLADecodeSm100:
                 seqlen_k_limit, softmax_scale_log2, n_block_lo + i + 1, False,
             )
         _, ps_P, ps_st = states
+        if const_expr(mbar_sum is not None):
+            # the stats pipeline publishes before the row sum, so the epilogue waits on this
+            cute.arch.mbarrier_arrive(mbar_sum)
         pl_P.producer_tail(ps_P)
         pl_stats.producer_tail(ps_st)
 
@@ -996,7 +1005,11 @@ class FlashAttentionMLADecodeSm100:
 
         # ---- block max per head across the 128 lanes: warp butterfly + smem -------
         for i in cutlass.range_constexpr(h):
-            tSrP[i] = warp_reduce(tSrS[i], cute.arch.fmax)
+            if const_expr(self.fp8_mma):
+                # one redux.sync.max.f32 per value; the same max as the fmax butterfly
+                tSrP[i] = utils.redux_max_f32(tSrS[i])
+            else:
+                tSrP[i] = warp_reduce(tSrS[i], cute.arch.fmax)
         if lane_idx == 0:
             for i in cutlass.range_constexpr(h):
                 sRed[warp_idx, i] = tSrP[i]
@@ -1022,11 +1035,20 @@ class FlashAttentionMLADecodeSm100:
                     if m_old != -Float32.inf else Float32(0.0)
                 )
         bar_sm.arrive_and_wait()
+        if const_expr(self.fp8_mma):
+            # publish the rescale factor now: the correction's O rescale (which O^T(b) waits
+            # for) overlaps this block's exp / P^T / row sum instead of following them
+            pl_stats.producer_commit(ps_st)
+            rMax = cute.make_rmem_tensor((h,), Float32)
+            cute.autovec_copy(sSmMax, rMax)  # LDS.128 instead of h scalar broadcasts
 
         # ---- P = exp2(S * scale_log2 - m_new * scale_log2) ------------------------
         for i in cutlass.range_constexpr(h):
             # Keep the true running max; only exponentiation needs a finite empty-row bias.
-            row_max = sSmMax[cS_t2r[i][1]]
+            if const_expr(self.fp8_mma):
+                row_max = rMax[cS_t2r[i][1]]
+            else:
+                row_max = sSmMax[cS_t2r[i][1]]
             safe_max = row_max if row_max != -Float32.inf else Float32(0.0)
             bias = -safe_max * softmax_scale_log2
             if const_expr(self.fp8_mma):
@@ -1035,21 +1057,11 @@ class FlashAttentionMLADecodeSm100:
                 bias = bias + FP8_P_SCALE_LOG2
             tSrP[i] = cute.math.exp2(tSrS[i] * softmax_scale_log2 + bias, fastmath=True)
 
-        # ---- row sum per head across the 128 lanes -------------------------------
-        for i in cutlass.range_constexpr(h):
-            tSrS[i] = warp_reduce(tSrP[i], operator.add)
-        if lane_idx == 0:
-            for i in cutlass.range_constexpr(h):
-                sRed[warp_idx, i] = tSrS[i]
-
-        # ---- P^T staging: this thread's key, all h heads, MN-major ---------------
-        pl_P.producer_acquire(ps_P)
-        pt_nd = cute.composition(sPt[None, None, None, ps_P.index], pt_layout)
-        if const_expr(not self.fp8_mma):
-            for i in cutlass.range_constexpr(h):
-                pt_nd[cS_t2r[i][1], key_row] = tSrP[i].to(sPt.element_type)
-        else:
-            # this key's row of [P_hi | P_lo]^T: 2h contiguous e4m3 (heads, then heads)
+        if const_expr(self.fp8_mma):
+            # P^T goes out before the row-sum shuffles: O^T waits for P^T, not the sum.
+            # This key's row of [P_hi | P_lo]^T: 2h contiguous e4m3 (heads, then heads).
+            pl_P.producer_acquire(ps_P)
+            pt_nd = cute.composition(sPt[None, None, None, ps_P.index], pt_layout)
             rHi = cute.make_rmem_tensor(tSrP.shape, cutlass.Float8E4M3FN)
             rHi.store(tSrP.load().to(cutlass.Float8E4M3FN))
             rRow = cute.make_rmem_tensor((2 * h,), cutlass.Float8E4M3FN)
@@ -1061,9 +1073,26 @@ class FlashAttentionMLADecodeSm100:
                 rRow[cS_t2r[i][1]] = rHi[i]
                 rRow[h + cS_t2r[i][1]] = rLo[i]
             cute.autovec_copy(rRow, pt_nd[None, key_row])
-        cute.arch.fence_proxy("async.shared", space="cta")
-        pl_P.producer_commit(ps_P)
-        ps_P.advance()
+            cute.arch.fence_proxy("async.shared", space="cta")
+            pl_P.producer_commit(ps_P)
+            ps_P.advance()
+
+        # ---- row sum per head across the 128 lanes -------------------------------
+        for i in cutlass.range_constexpr(h):
+            tSrS[i] = warp_reduce(tSrP[i], operator.add)
+        if lane_idx == 0:
+            for i in cutlass.range_constexpr(h):
+                sRed[warp_idx, i] = tSrS[i]
+
+        if const_expr(not self.fp8_mma):
+            # ---- P^T staging: this thread's key, all h heads, MN-major ---------------
+            pl_P.producer_acquire(ps_P)
+            pt_nd = cute.composition(sPt[None, None, None, ps_P.index], pt_layout)
+            for i in cutlass.range_constexpr(h):
+                pt_nd[cS_t2r[i][1], key_row] = tSrP[i].to(sPt.element_type)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            pl_P.producer_commit(ps_P)
+            ps_P.advance()
 
         bar_sm.arrive_and_wait()
         if tidx < h:
@@ -1076,7 +1105,8 @@ class FlashAttentionMLADecodeSm100:
                 sSmSum[tidx] = sSmSum[tidx] * sScale[st_idx, tidx] + s
         # the next block's sRed writes must not race this block's row-sum reads
         bar_sm.arrive_and_wait()
-        pl_stats.producer_commit(ps_st)
+        if const_expr(not self.fp8_mma):
+            pl_stats.producer_commit(ps_st)
         ps_st.advance()
         return cs_S, ps_P, ps_st
 
@@ -1135,7 +1165,7 @@ class FlashAttentionMLADecodeSm100:
         self, mQ, mQv, mO, mLSE, mma_O, accO, sQtC, sQtR,
         sScale, sSmMax, sSmSum, sInv, pl_O, pl_stats, mbar_Q,
         tidx, head_kv, m_idx, hg_idx, split_idx,
-        softmax_scale_log2, num_n_blocks,
+        softmax_scale_log2, num_n_blocks, mbar_sum=None,
     ):
         h = const_expr(self.h)
         ctid = tidx - self.corr_tid_lo
@@ -1214,6 +1244,8 @@ class FlashAttentionMLADecodeSm100:
 
         # ---- epilogue: O^T(n-1) is final -----------------------------------------
         pl_O.consumer_wait(cs_O)
+        if const_expr(mbar_sum is not None):
+            cute.arch.mbarrier_wait(mbar_sum, Int32(0))
         if ctid < h:
             rs = sSmSum[ctid]
             bad = rs == 0.0 or rs != rs
