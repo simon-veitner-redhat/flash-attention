@@ -378,7 +378,9 @@ def _fused_combine_semaphores_ready(device, num_splits, num_groups):
     return buf is not None and buf.shape[0] >= num_groups
 
 
-def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks, fp8_kv=False):
+def mla_decode_splits(
+    total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks, fp8_kv=False, dcp_size=1
+):
     """Choose head groups and KV splits for the sparse decode grid.
 
     More than 16 query heads per KV head only reach this kernel when DCP gathers 16 heads per
@@ -387,10 +389,15 @@ def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_block
     valid blocks, and never spend an extra wave on splitting.
 
     fp8_kv: the e4m3 kernel splits the valid window evenly at run time (every split sees valid
-    blocks whatever the valid length), so its > 16-head grids may split two ways. Under DCP its
-    top-k rows are few and dense in the request's own pages, so head-group CTAs share them
-    through L2: > 16-head fp8 grids take head groups (down to 8 heads) up to the SMs before
-    any KV split (TP4 DCP2 captures, h32 T32-T64: 11.4-13.1 vs 13.6-16.7 us split first).
+    blocks whatever the valid length), so its > 16-head grids may split two ways.
+
+    dcp_size: the caller's decode context parallel size, a host-side hint (the grid cannot see
+    the valid lengths). Under DCP (> 1) each rank's top-k rows are few (~ topk / dcp) and dense
+    in the request's own pages, so head-group CTAs share them through L2: > 16-head fp8 grids
+    then take head groups (down to 8 heads) up to the SMs before any KV split (TP4 DCP2
+    captures, h32 T32-T64: 11.4-13.1 vs 13.6-16.7 us split first). With every top-k row valid
+    (dcp_size 1) KV splits win (h32 ctx 32k, valid 2048, b8 / b32: 15.7 / 26.0 vs 19.5 / 43.0
+    us head groups first).
     """
     supported = FlashAttentionMLADecodeSm100.SUPPORTED_HEADS
     waves = lambda groups, splits: -(-total_q * nheads_kv * groups * splits // num_SMs)
@@ -408,7 +415,7 @@ def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_block
             groups *= 2
         return groups
 
-    if fp8_kv and qhead_per_kvhead > 16:
+    if fp8_kv and qhead_per_kvhead > 16 and dcp_size > 1:
         head_groups = grow_head_groups(head_groups, 8, 1)
     # Fewest waves per split, with at least two blocks per split.
     candidates = [1] + [
@@ -739,6 +746,7 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     sparse_decode_fused_combine: bool = False,
+    sparse_decode_dcp_size: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -1105,6 +1113,7 @@ def _flash_attn_fwd(
             get_num_sms_for_selection(device.index, arch),
             gather_kv_indices.shape[-1] // 128,
             fp8_kv=is_fp8,
+            dcp_size=sparse_decode_dcp_size,
         )
         num_splits = decode_splits[1]
 

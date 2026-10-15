@@ -403,10 +403,10 @@ def test_decode_batch_lookup_per_request_kv(q_lens, fp8):
     flat_kv.assert_close(out, lse, out_ref, lse_ref, out_pt, counts)
 
 
-@pytest.mark.parametrize("num_heads,total_q", [(32, 8), (32, 16), (16, 8)])
-def test_decode_fp8_fused_combine_graph_capture(num_heads, total_q):
-    """fp8 split-KV grids (h32 b8 / b16, h16 b8) with the fused combine and short ragged valid
-    lengths, in a CUDA graph: captured before any eager call (falls back to the separate combine
+@pytest.mark.parametrize("num_heads,total_q,dcp_size", [(32, 8, 1), (32, 16, 2), (16, 8, 1)])
+def test_decode_fp8_fused_combine_graph_capture(num_heads, total_q, dcp_size):
+    """fp8 split-KV grids (h32 b8, h32 b16 under the DCP2 plan, h16 b8) with the fused combine
+    and short ragged valid lengths, in a CUDA graph: captured before any eager call (falls back to the separate combine
     kernel) and after one (fused, ticket buffer sized), each replayed twice against the bf16
     upcast."""
     import flash_attn.cute.interface as interface
@@ -419,7 +419,9 @@ def test_decode_fp8_fused_combine_graph_capture(num_heads, total_q):
     cu_q = flat_kv.cu_seqlens_from([1] * total_q, device)
     zeros = torch.zeros(total_q + 1, device=device, dtype=torch.int32)
     used = torch.full((total_q,), NUM_KV_ROWS, device=device, dtype=torch.int32)
-    splits = mla_decode_splits(total_q, 1, num_heads, 148, TOPK // TILE_N, fp8_kv=True)[1]
+    splits = mla_decode_splits(
+        total_q, 1, num_heads, 148, TOPK // TILE_N, fp8_kv=True, dcp_size=dcp_size
+    )[1]
     assert splits > 1
 
     def call():
@@ -430,6 +432,7 @@ def test_decode_fp8_fused_combine_graph_capture(num_heads, total_q):
             gather_kv_indices=idx, gather_kv_valid_length=valid_len,
             softmax_scale=SOFTMAX_SCALE, causal=False, return_lse=True,
             sparse_decode_fused_combine=True,
+            sparse_decode_dcp_size=dcp_size,
         )
         return out, (lse if lse.shape[0] == total_q else lse.t())
 
