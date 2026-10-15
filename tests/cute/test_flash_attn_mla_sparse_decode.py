@@ -351,3 +351,53 @@ def test_decode_fp8_q_peaked_softmax(num_heads):
     err = (out8.float() - out16.float()).abs().amax(-1) / out16.float().abs().amax(-1)
     assert err.max() < 2.0**-8, f"per-head max error {err.max():.2e}"
     torch.testing.assert_close(lse8, lse16, atol=1e-4, rtol=0)
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize(
+    "q_lens",
+    [[1] * 9, [2] * 9, [1, 2, 2, 1, 2, 1, 1, 2, 2], [1, 5, 2, 8, 1, 3, 16, 4]],
+    ids=["q1", "q2", "q1q2", "ragged"],
+)
+def test_decode_batch_lookup_per_request_kv(q_lens, fp8):
+    """Per-request KV regions of different lengths (cu_seqlens_k + seqused_k) under varlen q:
+    every token must find its own request (the fp8 path's batch = m_idx and m_idx / 2 guesses
+    and the binary-search fallback) and mask its indices past that request's length, which
+    point into the next request's rows."""
+    device = "cuda"
+    batch, total_q, topk, n_masked = len(q_lens), sum(q_lens), 256, 5
+    kv_lens = [64 + 37 * r for r in range(batch)]
+    cuq = flat_kv.cu_seqlens_from(q_lens, device)
+    cuk = flat_kv.cu_seqlens_from(kv_lens, device)
+    gen = torch.Generator(device=device).manual_seed(70)
+    kv = torch.randn(sum(kv_lens), 1, 576, device=device, generator=gen).to(torch.bfloat16)
+    q, qv = flat_kv.make_q(total_q, device, seed=71, num_heads=16)
+    idx = torch.full((total_q, topk), -1, device=device, dtype=torch.int32)
+    ref_idx = torch.full((total_q, topk), -1, device=device, dtype=torch.int32)
+    counts, valid = [], []
+    t = 0
+    for r, n_q in enumerate(q_lens):
+        for _ in range(n_q):
+            n = [min(kv_lens[r], topk - n_masked), 1, 50][t % 3]
+            perm = torch.randperm(kv_lens[r], device=device, generator=gen)[:n].int()
+            idx[t, :n] = perm
+            # in the valid window but past this request's KV length: masked by seqused_k
+            idx[t, n:n + n_masked] = kv_lens[r] + torch.arange(n_masked, device=device).int()
+            ref_idx[t, :n] = int(cuk[r]) + perm
+            counts.append(n)
+            valid.append(n + n_masked)
+            t += 1
+    (q_in, qv_in, k_in, v_in), (q, qv, kv) = to_fp8(fp8, q, qv, kv)
+    out, lse = flash_attn_varlen_func(
+        q_in, k_in, v_in, qv=qv_in,
+        cu_seqlens_q=cuq, cu_seqlens_k=cuk,
+        seqused_k=torch.tensor(kv_lens, device=device, dtype=torch.int32),
+        max_seqlen_q=max(q_lens), max_seqlen_k=max(kv_lens),
+        gather_kv_indices=idx,
+        gather_kv_valid_length=torch.tensor(valid, device=device, dtype=torch.int32),
+        softmax_scale=SOFTMAX_SCALE,
+        return_lse=True,
+    )
+    out_ref, lse_ref = flat_kv.ref_sparse_mla(q, qv, kv, ref_idx, counts)
+    out_pt, _ = flat_kv.ref_sparse_mla(q, qv, kv, ref_idx, counts, upcast=False)
+    flat_kv.assert_close(out, lse, out_ref, lse_ref, out_pt, counts)

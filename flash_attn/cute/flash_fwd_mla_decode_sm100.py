@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Colfax International.
 """SM100 sparse-MLA (DSA) decode kernel: the gathered KV tile is the A operand of both MMAs."""
 
+import dataclasses
 import math
 import operator
 from typing import Callable, Optional
@@ -350,48 +351,52 @@ class FlashAttentionMLADecodeSm100:
         hg_idx = rem % self.num_head_groups
         split_idx = rem // self.num_head_groups
 
+        valid_len = None
+        idx_first = None
         if const_expr(not self.fp8_mma):
             batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
         else:
-            # decode requests carry 1 or 2 queries (2 with MTP): try batch = m_idx and m_idx / 2
-            # (four independent loads) before the binary search's chain of dependent loads
+            # loads that depend only on the CTA index go out first and are consumed after the
+            # setup barrier, so their latency hides under the barrier init and TMEM alloc
+            if const_expr(mTopkValidLen is not None):
+                valid_len = mTopkValidLen[m_idx]
+            if const_expr(not self.is_split_kv):
+                idx_lo = Int32(0)
+            else:
+                idx_lo = split_idx * Int32(self.blocks_per_split * self.tile_n)
+            idx_first = Int32(0)
+            if warp_idx >= self.gather_warp_lo:
+                # the gather's first top-k index (CpasyncGatherKVManager.load_index_topk map)
+                idx_first = mIndexTopk[idx_lo + self._gather_index_row(tidx - self.gather_tid_lo), m_idx]
+            # batch lookup: decode requests carry 1 or 2 queries (2 with MTP), so batch = m_idx
+            # and m_idx / 2 are checked (four independent loads) before the binary search, and
+            # the K lengths of batch m_idx are loaded speculatively alongside; all resolved
+            # after the setup barrier (_resolve_batch)
             last_b = cute.size(mCuSeqlensQ) - 2
             g1 = min(m_idx, last_b)
             g2 = min(m_idx // 2, last_b)
-            hit1 = mCuSeqlensQ[g1] <= m_idx and m_idx < mCuSeqlensQ[g1 + 1]
-            hit2 = mCuSeqlensQ[g2] <= m_idx and m_idx < mCuSeqlensQ[g2 + 1]
-            batch_idx = g1
-            if not hit1:
-                batch_idx = g2
-                if not hit2:
-                    batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
-        seqlen = SeqlenInfoQK.create(
-            batch_idx, Int32(1), Int32(1),
-            mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,
-            mSeqUsedQ=None, mSeqUsedK=mSeqUsedK,
-            tile_m=self.tile_n, tile_n=self.tile_n,
-        )
-        seqlen_k_limit = seqlen.seqlen_k
-
-        if const_expr(mTopkValidLen is None):
-            n_valid_blocks = Int32(self.n_blocks_full)
-        else:
-            n_valid_blocks = max(
-                Int32(1),
-                min(
-                    cute.ceil_div(mTopkValidLen[m_idx], self.tile_n),
-                    Int32(self.n_blocks_full),
-                ),
+            guess = (
+                g1, g2,
+                mCuSeqlensQ[g1], mCuSeqlensQ[g1 + 1], mCuSeqlensQ[g2], mCuSeqlensQ[g2 + 1],
             )
-        if const_expr(not self.is_split_kv):
-            n_block_lo = Int32(0)
-            num_n_blocks = n_valid_blocks
-        else:
-            # a split entirely past the valid window still walks one all-masked block
-            n_block_lo = split_idx * Int32(self.blocks_per_split)
-            num_n_blocks = max(
-                Int32(1),
-                min(n_valid_blocks, n_block_lo + Int32(self.blocks_per_split)) - n_block_lo,
+            seqlen_spec = SeqlenInfoQK.create(
+                g1, Int32(1), Int32(1),
+                mCuSeqlensQ=None, mCuSeqlensK=mCuSeqlensK,
+                mSeqUsedQ=None, mSeqUsedK=mSeqUsedK,
+                tile_m=self.tile_n, tile_n=self.tile_n,
+            )
+        if const_expr(not self.fp8_mma):
+            seqlen = SeqlenInfoQK.create(
+                batch_idx, Int32(1), Int32(1),
+                mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,
+                mSeqUsedQ=None, mSeqUsedK=mSeqUsedK,
+                tile_m=self.tile_n, tile_n=self.tile_n,
+            )
+            seqlen_k_limit = seqlen.seqlen_k
+
+        if const_expr(not self.fp8_mma):
+            n_block_lo, num_n_blocks = self._block_range(
+                None if const_expr(mTopkValidLen is None) else mTopkValidLen[m_idx], split_idx
             )
 
         # ==== smem ==================================================================
@@ -493,6 +498,12 @@ class FlashAttentionMLADecodeSm100:
         cute.arch.barrier()
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(Float32)
+        if const_expr(self.fp8_mma):
+            n_block_lo, num_n_blocks = self._block_range(valid_len, split_idx)
+            batch_idx, seqlen = self._resolve_batch(
+                m_idx, guess, seqlen_spec, mCuSeqlensQ, mCuSeqlensK, mSeqUsedK
+            )
+            seqlen_k_limit = seqlen.seqlen_k
 
         thr_mma_S = mma_S.get_slice(0)
         thr_mma_O = mma_O.get_slice(0)
@@ -544,7 +555,7 @@ class FlashAttentionMLADecodeSm100:
             self.gather_loop(
                 mIndexTopk, mK, mV, sLatK, sRope, pl_lat, pl_rope,
                 tidx, warp_idx, m_idx, seqlen, batch_idx, head_kv, seqlen_k_limit,
-                dtype, n_block_lo, num_n_blocks,
+                dtype, n_block_lo, num_n_blocks, idx_first,
             )
 
         if const_expr(self.fused_combine):
@@ -707,12 +718,61 @@ class FlashAttentionMLADecodeSm100:
                     if dv == 0:
                         mLSEFinal[m_idx, hh] = cute.math.log(lse_sum, fastmath=True) + lse_max
 
+    @cute.jit
+    def _block_range(self, valid_len, split_idx):
+        """(first block, block count) of this CTA's top-k window; valid_len None = all valid."""
+        if const_expr(valid_len is None):
+            n_valid_blocks = Int32(self.n_blocks_full)
+        else:
+            n_valid_blocks = max(
+                Int32(1),
+                min(
+                    cute.ceil_div(valid_len, self.tile_n),
+                    Int32(self.n_blocks_full),
+                ),
+            )
+        if const_expr(not self.is_split_kv):
+            n_block_lo = Int32(0)
+            num_n_blocks = n_valid_blocks
+        else:
+            # a split entirely past the valid window still walks one all-masked block
+            n_block_lo = split_idx * Int32(self.blocks_per_split)
+            num_n_blocks = max(
+                Int32(1),
+                min(n_valid_blocks, n_block_lo + Int32(self.blocks_per_split)) - n_block_lo,
+            )
+        return n_block_lo, num_n_blocks
+
+    @cute.jit
+    def _resolve_batch(self, m_idx, guess, seqlen_spec, mCuSeqlensQ, mCuSeqlensK, mSeqUsedK):
+        """fp8_mma batch lookup: the guessed bracket, else m_idx / 2's, else the binary search.
+        Only seqlen_k and offset_k of the returned SeqlenInfoQK are meaningful (all this kernel
+        reads); on a miss of batch = m_idx they are loaded again for the found batch."""
+        g1, g2, lo1, hi1, lo2, hi2 = guess
+        batch_idx = g1
+        seqlen_k = seqlen_spec.seqlen_k
+        offset_k = seqlen_spec.offset_k
+        if not (lo1 <= m_idx and m_idx < hi1):
+            batch_idx = g2
+            if not (lo2 <= m_idx and m_idx < hi2):
+                batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
+            found = SeqlenInfoQK.create(
+                batch_idx, Int32(1), Int32(1),
+                mCuSeqlensQ=None, mCuSeqlensK=mCuSeqlensK,
+                mSeqUsedQ=None, mSeqUsedK=mSeqUsedK,
+                tile_m=self.tile_n, tile_n=self.tile_n,
+            )
+            seqlen_k = found.seqlen_k
+            if const_expr(mCuSeqlensK is not None):
+                offset_k = found.offset_k
+        return batch_idx, dataclasses.replace(seqlen_spec, seqlen_k=seqlen_k, offset_k=offset_k)
+
     # ================================================================ gather warps
     @cute.jit
     def gather_loop(
         self, mIndexTopk, mK, mV, sLatK, sRope, pl_lat, pl_rope,
         tidx, warp_idx, m_idx, seqlen, batch_idx, head_kv, seqlen_k_limit, dtype,
-        n_block_lo, num_n_blocks,
+        n_block_lo, num_n_blocks, idx_first=None,
     ):
         mgr = CpasyncGatherKVManager.create(
             mIndexTopk[None, m_idx],
@@ -736,8 +796,16 @@ class FlashAttentionMLADecodeSm100:
         ps_lat = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.n_lat)
         ps_rope = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.n_rope)
 
+        if const_expr(idx_first is not None):
+            # fp8_mma: block 0's index was loaded before the setup barrier
+            assert mgr.topk_indices_per_thread == 1
+            assert mgr.gmem_threads_per_row == math.gcd(self.hdim_rope, self.dv_chunk, 128) // 16
+            mgr.rTopkHalf[0] = idx_first
         for n_block in cutlass.range(num_n_blocks, unroll=1):
-            mgr.load_index_topk(n_block_lo + n_block, transpose=False)
+            if const_expr(idx_first is None):
+                mgr.load_index_topk(n_block_lo + n_block, transpose=False)
+            elif n_block > 0:
+                mgr.load_index_topk(n_block_lo + n_block, transpose=False)
             for c in cutlass.range_constexpr(self.num_chunks):
                 pl_lat.producer_acquire(ps_lat)
                 mgr.load_X(
@@ -755,6 +823,13 @@ class FlashAttentionMLADecodeSm100:
         # every empty-barrier arrive (a tcgen05 commit from the MMA warp) must have landed
         pl_lat.producer_tail(ps_lat)
         pl_rope.producer_tail(ps_rope)
+
+    def _gather_index_row(self, gtid):
+        """Tile row whose top-k index gather thread gtid loads (CpasyncGatherKVManager's
+        load_index_topk map with one index per thread)."""
+        # e4m3 rows: 16 B copies over gcd(64 rope, 128 latent-chunk) elements
+        tpr = math.gcd(self.hdim_rope, self.dv_chunk, 128) // 16
+        return (gtid % tpr) * (self.num_gather_threads // tpr) + gtid // tpr
 
     # ================================================================== MMA warp
     @cute.jit
