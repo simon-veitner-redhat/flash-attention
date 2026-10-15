@@ -344,6 +344,8 @@ def _make_compile_only_tensor_spec(
 
 
 _FUSED_COMBINE_SEMAPHORES = {}
+# outgrown buffers stay alive: a CUDA graph captured against one still points at it
+_FUSED_COMBINE_RETIRED = []
 
 
 def _fused_combine_semaphores(device, num_splits, num_groups):
@@ -364,6 +366,8 @@ def _fused_combine_semaphores(device, num_splits, num_groups):
             f"{0 if buf is None else buf.shape[0]} allocated)"
         )
         rows = max(4096, 1 << (num_groups - 1).bit_length())
+        if buf is not None:
+            _FUSED_COMBINE_RETIRED.append(buf)
         buf = torch.zeros(rows, num_splits + 1, dtype=torch.int64, device=device)
         _FUSED_COMBINE_SEMAPHORES[key] = buf
     return buf
