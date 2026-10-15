@@ -10,6 +10,7 @@ import test_flash_attn_mla_sparse_flat_kv as flat_kv
 from test_flash_attn_mla_sparse_flat_kv import IS_SM100, SOFTMAX_SCALE, TILE_N, TOPK
 
 from flash_attn.cute import flash_attn_varlen_func
+from flash_attn.cute.interface import mla_decode_splits
 
 NUM_KV_ROWS = 4096
 HEADS = [8, 16, 32, 64]
@@ -237,23 +238,16 @@ def test_decode_cache_reuse_and_kv_offsets(kv_heads, fp8):
                 )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype,fp8",
+    [(torch.float16, None), (torch.bfloat16, None), (torch.bfloat16, "kv"),
+     (torch.bfloat16, "kvq")],
+)
 @pytest.mark.parametrize("num_heads", [8, 16, 32])
 @pytest.mark.parametrize("tokens,topk", [(1, 2048), (148, 256)])
 @pytest.mark.parametrize("use_valid_length", [False, True])
-def test_decode_leading_empty_block(dtype, num_heads, tokens, topk, use_valid_length):
+def test_decode_leading_empty_block(dtype, fp8, num_heads, tokens, topk, use_valid_length):
     """An empty first block must not clamp subsequent negative score maxima to zero."""
-    leading_empty_block(dtype, num_heads, tokens, topk, use_valid_length, None)
-
-
-@pytest.mark.parametrize("fp8", ["kv", "kvq"])
-@pytest.mark.parametrize("num_heads", [8, 16, 32])
-@pytest.mark.parametrize("tokens,topk", [(1, 2048), (148, 256)])
-def test_decode_leading_empty_block_fp8(fp8, num_heads, tokens, topk):
-    leading_empty_block(torch.bfloat16, num_heads, tokens, topk, True, fp8)
-
-
-def leading_empty_block(dtype, num_heads, tokens, topk, use_valid_length, fp8):
     q = torch.zeros(tokens, num_heads, 64, device="cuda", dtype=dtype)
     qv = torch.full((tokens, num_heads, 512), -10, device="cuda", dtype=dtype)
     kv = torch.zeros(1, 1, 576, device="cuda", dtype=dtype)
@@ -286,6 +280,32 @@ def fp8_flat_kv(num_rows, device, seed, poison_rows=4):
     return kv8, kv8[..., 512:], kv8[..., :512]
 
 
+def run_fp8_and_upcast(q, qv, kv8, idx, valid_len):
+    """The decode kernel on e4m3 K/V (and q) and the 16-bit kernel on the exact upcast."""
+    dtype16 = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+    kv16 = kv8.to(dtype16)
+    cu_seqlens_q = flat_kv.cu_seqlens_from([1] * q.shape[0], q.device)
+    out8, lse8 = run_decode(q, qv, kv8[..., 512:], kv8[..., :512], cu_seqlens_q, idx, valid_len)
+    out16, lse16 = run_decode(
+        q.to(dtype16), qv.to(dtype16), kv16[..., 512:], kv16[..., :512], cu_seqlens_q, idx,
+        valid_len,
+    )
+    assert out8.dtype == dtype16
+    return out8, lse8, out16, lse16
+
+
+def assert_fp8_q_close(out8, lse8, out16, lse16, counts):
+    """e4m3 q: P^T is e4m3 hi + lo terms, so O matches to ~2^-8 and the LSE (fp32 scores of
+    the same e4m3 products) to rounding."""
+    assert torch.isfinite(out8).all(), "NaN/inf in the fp8-MMA output"
+    empty = torch.tensor([n == 0 for n in counts], device=out8.device)
+    assert (out8[empty] == 0).all() and (lse8[empty] == -math.inf).all()
+    rel = ((out8.float() - out16.float()).norm() / out16.float().norm()).item()
+    assert rel < 4e-3, f"fp8-MMA output relL2 {rel:.2e} vs the 16-bit kernel"
+    lse_err = (lse8[~empty] - lse16[~empty]).abs().max().item()
+    assert lse_err < 1e-4, f"fp8-MMA LSE max diff {lse_err:.2e}"
+
+
 @pytest.mark.parametrize("total_q", [9, 148])
 @pytest.mark.parametrize(
     "num_heads,dtype",
@@ -295,33 +315,56 @@ def fp8_flat_kv(num_rows, device, seed, poison_rows=4):
 )
 def test_decode_fp8_kv_vs_upcast_cache(num_heads, dtype, total_q):
     """fp8 e4m3 K/V against the 16-bit kernel on the upcast inputs, with ragged/empty rows and
-    -1 sentinels next to NaN bytes. A 16-bit Q widens K/V exactly: O and LSE match bit for bit.
-    An e4m3 Q runs kind::f8f6f4 MMAs with P^T as e4m3 hi + lo terms: LSE (fp32 scores of the
-    same e4m3 products) matches to rounding, O to the P quantization residual (~2^-8)."""
+    -1 sentinels next to NaN bytes. A 16-bit Q widens K/V exactly: O and LSE match bit for bit."""
     device = "cuda"
-    fp8_q = dtype == torch.float8_e4m3fn
-    dtype16 = torch.bfloat16 if fp8_q else dtype
     counts = ragged_counts(total_q)
-    kv8, k8, v8 = fp8_flat_kv(NUM_KV_ROWS, device, seed=60 + total_q)
-    kv16 = kv8.to(dtype16)
+    kv8, _, _ = fp8_flat_kv(NUM_KV_ROWS, device, seed=60 + total_q)
     q, qv = flat_kv.make_q(total_q, device, dtype=dtype, seed=61, num_heads=num_heads)
     idx, valid_len = flat_kv.make_indices(counts, NUM_KV_ROWS, device, seed=62)
-    cu_seqlens_q = flat_kv.cu_seqlens_from([1] * total_q, device)
-
-    out8, lse8 = run_decode(q, qv, k8, v8, cu_seqlens_q, idx, valid_len)
-    out16, lse16 = run_decode(
-        q.to(dtype16), qv.to(dtype16), kv16[..., 512:], kv16[..., :512], cu_seqlens_q, idx,
-        valid_len,
-    )
-    assert out8.dtype == dtype16
-    if not fp8_q:
+    out8, lse8, out16, lse16 = run_fp8_and_upcast(q, qv, kv8, idx, valid_len)
+    if dtype != torch.float8_e4m3fn:
         assert torch.equal(out8, out16), "fp8 KV output differs from the 16-bit kernel"
         assert torch.equal(lse8, lse16), "fp8 KV LSE differs from the 16-bit kernel"
-        return
-    assert torch.isfinite(out8).all(), "NaN/inf in the fp8-MMA output"
-    empty = torch.tensor([n == 0 for n in counts], device=device)
-    assert (out8[empty] == 0).all() and (lse8[empty] == -math.inf).all()
-    rel = ((out8.float() - out16.float()).norm() / out16.float().norm()).item()
-    assert rel < 4e-3, f"fp8-MMA output relL2 {rel:.2e} vs the 16-bit kernel"
-    lse_err = (lse8[~empty] - lse16[~empty]).abs().max().item()
-    assert lse_err < 1e-4, f"fp8-MMA LSE max diff {lse_err:.2e}"
+    else:
+        assert_fp8_q_close(out8, lse8, out16, lse16, counts)
+
+
+@pytest.mark.parametrize("n_blocks", [1, 2, 3])
+@pytest.mark.parametrize(
+    "total_q,topk,lead,splits", [(148, 3 * TILE_N, 0, 1), (1, 6 * TILE_N, 3, 2)],
+    ids=["unsplit", "split"],
+)
+def test_decode_fp8_q_n_blocks(decode_route, total_q, topk, lead, splits, n_blocks):
+    """e4m3 q with 1-3 blocks per CTA: the S^T look-ahead and the S^T/P^T stage parity at the
+    tail. The split grid walks 2 x 3 blocks, so its second split sees n_blocks of them."""
+    device = "cuda"
+    counts = [(lead + n_blocks) * TILE_N] * total_q
+    kv8, _, _ = fp8_flat_kv(NUM_KV_ROWS, device, seed=63)
+    q, qv = flat_kv.make_q(total_q, device, dtype=torch.float8_e4m3fn, seed=64, num_heads=16)
+    idx, valid_len = flat_kv.make_indices(counts, NUM_KV_ROWS, device, seed=65, topk=topk)
+    out8, lse8, out16, lse16 = run_fp8_and_upcast(q, qv, kv8, idx, valid_len)
+    assert mla_decode_splits(*decode_route[0])[1] == splits
+    assert_fp8_q_close(out8, lse8, out16, lse16, counts)
+
+
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+def test_decode_fp8_q_peaked_softmax(num_heads):
+    """e4m3 q under a peaked softmax (logits 0, -1, -2, -3, the rest -20): the hi + lo P^T
+    terms keep every head's output within ~2^-8, which a global relL2 could hide."""
+    device = "cuda"
+    total_q = NUM_KV_ROWS // TOPK  # disjoint rows, so each row's logit is per token
+    kv8, _, _ = fp8_flat_kv(NUM_KV_ROWS, device, seed=66)
+    idx = torch.randperm(NUM_KV_ROWS, device=device).view(total_q, TOPK).int()
+    logits = torch.full((TOPK,), -20.0, device=device)
+    logits[:4] = torch.tensor([0.0, -1.0, -2.0, -3.0])
+    # score = SOFTMAX_SCALE * qv[0] * latent[0] with qv[0] = 2: latent[0] = 12 * logit (exact)
+    kv8[idx.long(), 0, 0] = (logits / (2 * SOFTMAX_SCALE)).to(kv8.dtype)
+    q = torch.zeros(total_q, num_heads, 64, device=device).to(torch.float8_e4m3fn)
+    qv = torch.zeros(total_q, num_heads, 512, device=device)
+    qv[..., 0] = 2
+    out8, lse8, out16, lse16 = run_fp8_and_upcast(
+        q, qv.to(torch.float8_e4m3fn), kv8, idx, torch.full((total_q,), TOPK, device=device).int()
+    )
+    err = (out8.float() - out16.float()).abs().amax(-1) / out16.float().abs().amax(-1)
+    assert err.max() < 1e-2, f"per-head max error {err.max():.2e}"
+    torch.testing.assert_close(lse8, lse16, atol=1e-4, rtol=0)

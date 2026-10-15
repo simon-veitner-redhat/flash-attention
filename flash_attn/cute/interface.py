@@ -776,10 +776,11 @@ def _flash_attn_fwd(
     assert v.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
-    # MLA decode over a per-tensor fp8 e4m3 KV cache (e.g. vLLM's `fp8` 576 B rows), with a
-    # bf16/fp16 or e4m3 q/qv: the sparse decode kernel widens K/V (and an e4m3 Q) exactly to
-    # 16 bit in-kernel. No descales: the caller folds q_scale * k_scale into softmax_scale and
-    # multiplies the output by v_scale. The output is q's dtype, bf16 for an e4m3 q.
+    # MLA decode over a per-tensor fp8 e4m3 KV cache (e.g. vLLM's `fp8` 576 B rows). A 16-bit
+    # q/qv widens K/V exactly in-kernel; an e4m3 q/qv runs kind::f8f6f4 MMAs with P^T as e4m3
+    # hi + lo terms (O to ~2^-8 relative, the LSE to fp32 rounding). No descales: the caller
+    # folds q_scale * k_scale into softmax_scale and multiplies the output (q's dtype, bf16 for
+    # an e4m3 q) by v_scale.
     fp8_kv_mla_decode = (
         not fp8_kv_dequant
         and qv is not None
@@ -790,15 +791,6 @@ def _flash_attn_fwd(
     )
     if fp8_kv_mla_decode:
         assert q is None or q.dtype == qv.dtype, f"q.dtype {q.dtype} != qv.dtype {qv.dtype}"
-        assert q_descale is None and k_descale is None and v_descale is None, (
-            "fp8 KV MLA decode takes no descales: fold q_scale * k_scale into softmax_scale "
-            "and multiply the output by v_scale"
-        )
-        for t, name in ((q, "q"), (qv, "qv"), (k, "k"), (v, "v")):
-            if t is not None and t.dtype == torch.float8_e4m3fn:
-                assert all(st % 16 == 0 for st in t.stride()[:-1]), (
-                    f"fp8 {name} needs 16-byte aligned strides, got {t.stride()}"
-                )
     if fp8_kv_dequant:
         # FP8-KV in-kernel dequant: fp16/bf16 Q + fp8 e4m3 K/V (dequantized in-kernel to
         # fp16), fp16/bf16 O. Compute is always fp16 (the single-instruction fp8->fp16 fast
@@ -1691,7 +1683,6 @@ def _flash_attn_fwd(
                     qhead_per_kvhead=qhead_per_kvhead,
                     num_splits=num_splits,
                     num_head_groups=decode_splits[0],
-                    kv_format="fp8_e4m3" if fp8_kv_mla_decode else None,
                 )
             elif qv is not None:
                 paged_kv_cpasync = page_table is not None and page_size != tile_n
