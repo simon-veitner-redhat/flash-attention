@@ -349,7 +349,21 @@ class FlashAttentionMLADecodeSm100:
         hg_idx = rem % self.num_head_groups
         split_idx = rem // self.num_head_groups
 
-        batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
+        if const_expr(not self.fp8_mma):
+            batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
+        else:
+            # decode requests carry 1 or 2 queries (2 with MTP): try batch = m_idx and m_idx / 2
+            # (four independent loads) before the binary search's chain of dependent loads
+            last_b = cute.size(mCuSeqlensQ) - 2
+            g1 = min(m_idx, last_b)
+            g2 = min(m_idx // 2, last_b)
+            hit1 = mCuSeqlensQ[g1] <= m_idx and m_idx < mCuSeqlensQ[g1 + 1]
+            hit2 = mCuSeqlensQ[g2] <= m_idx and m_idx < mCuSeqlensQ[g2 + 1]
+            batch_idx = g1
+            if not hit1:
+                batch_idx = g2
+                if not hit2:
+                    batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
         seqlen = SeqlenInfoQK.create(
             batch_idx, Int32(1), Int32(1),
             mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,
