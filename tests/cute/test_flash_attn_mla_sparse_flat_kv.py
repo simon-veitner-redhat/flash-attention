@@ -363,3 +363,49 @@ def test_fp8_kv_unsupported_routes_raise():
     q, qv = [t.to(torch.float8_e4m3fn) for t in make_q(4, device, num_heads=128)]
     with pytest.raises(NotImplementedError, match="sparse decode kernel"):
         run_kernel(q, qv, k8, v8, cu_seqlens_q, 1024, idx, valid_len)
+
+
+_LAGGED_COMBINE = """
+import sys, torch
+import flash_attn.cute.flash_fwd_mla_decode_sm100 as dec
+import flash_attn.cute.interface as interface
+from test_flash_attn_mla_sparse_decode import fp8_flat_kv, NUM_KV_ROWS
+from test_flash_attn_mla_sparse_flat_kv import make_q, make_indices, cu_seqlens_from, SOFTMAX_SCALE
+dec.FUSED_COMBINE_TEST_LAG_NS = 200000
+total_q, num_heads = int(sys.argv[1]), int(sys.argv[2])
+kv8, _, _ = fp8_flat_kv(NUM_KV_ROWS, "cuda", seed=90)
+q, qv = make_q(total_q, "cuda", dtype=torch.float8_e4m3fn, seed=91, num_heads=num_heads)
+counts = ([600, 1, 129, 0, 1024, 257, 2048, 384] * total_q)[:total_q]
+idx, valid_len = make_indices(counts, NUM_KV_ROWS, "cuda", seed=92)
+cu_q = cu_seqlens_from([1] * total_q, "cuda")
+kw = dict(qv=qv, cu_seqlens_q=cu_q, cu_seqlens_k=torch.zeros(total_q + 1, device="cuda",
+          dtype=torch.int32), seqused_k=torch.full((total_q,), NUM_KV_ROWS, device="cuda",
+          dtype=torch.int32), max_seqlen_q=1, max_seqlen_k=NUM_KV_ROWS, gather_kv_indices=idx,
+          gather_kv_valid_length=valid_len, softmax_scale=SOFTMAX_SCALE, causal=False,
+          return_lse=True)
+ref = interface._flash_attn_fwd(q, kv8[..., 512:], kv8[..., :512], **kw)[0]
+for _ in range(3):
+    out = interface._flash_attn_fwd(q, kv8[..., 512:], kv8[..., :512],
+                                    sparse_decode_fused_combine=True, **kw)[0]
+    torch.cuda.synchronize()
+    # S >= 4 sums the splits in another order than the combine kernel (<= 2 bf16 ulp)
+    torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+print("LAGGED_OK")
+"""
+
+
+@pytest.mark.parametrize("num_heads,total_q", [(16, 216), (32, 8)])
+def test_decode_fp8_fused_combine_lagging_warp(num_heads, total_q):
+    """A correction warp that reaches the fused combine's ticket wait 200 us late (compiled in
+    through FUSED_COMBINE_TEST_LAG_NS) must not hang the CTA: the abandoned-mask broadcast of
+    the last CTA once completed a second phase of the ticket mbarrier, after which the late
+    warp's parity-0 wait never returned. Runs in a subprocess under a timeout."""
+    import os, subprocess, sys
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([here, os.environ.get("PYTHONPATH", "")]))
+    r = subprocess.run(
+        [sys.executable, "-c", _LAGGED_COMBINE, str(total_q), str(num_heads)],
+        env=env, cwd=here, capture_output=True, text=True, timeout=300,
+    )
+    assert r.returncode == 0 and "LAGGED_OK" in r.stdout, r.stdout[-2000:] + r.stderr[-4000:]

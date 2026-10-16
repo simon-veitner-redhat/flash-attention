@@ -32,6 +32,9 @@ SMEM_CAP_BYTES = 232448  # the measured SM100 dynamic-smem ceiling
 # fused combine: how long a finished split CTA waits for its group before leaving its slice to
 # the group's last CTA (only reached if the group's CTAs are not all resident at once)
 FUSED_COMBINE_WAIT_NS = 20000
+# test only: one correction warp idles this long before its first wait in the fused combine,
+# modelling a warp that falls behind its CTA (0 compiles nothing)
+FUSED_COMBINE_TEST_LAG_NS = 0
 
 # 16-bit KV: h -> (latent ring depth, P^T aliased onto the rope ring); 1 rope stage, 1 P^T.
 _RING = {8: (6, False), 16: (6, True), 32: (5, False)}
@@ -170,9 +173,9 @@ class FlashAttentionMLADecodeSm100:
         return mma_S, mma_O, LlatK, LlatMN, Lrope, LqtC, LqtR, Lpt
 
     def _get_shared_storage_cls(self, dtype, n_lat, alias_pt_on_rope):
-        # fused combine: [epoch, slot | claimed << 8, steal mask, mbarrier]; sits in the padding
-        # before the 128-B aligned sRed, so the smem footprint does not change
-        comb_words = 4 if self.fused_combine else 0
+        # fused combine: [epoch, slot | claimed << 8, steal mask, ticket mbarrier, mask mbarrier];
+        # sits in the padding before the 128-B aligned sRed
+        comb_words = 5 if self.fused_combine else 0
         align = self.buffer_align_bytes
         h = self.h
         tn = self.tile_n
@@ -502,8 +505,10 @@ class FlashAttentionMLADecodeSm100:
                 cute.arch.mbarrier_init(mbar_sum, self.num_softmax_threads)
         if const_expr(self.fused_combine):
             if tidx == 0:
-                # one-thread broadcast barrier of the fused combine (phase 0: ticket, 1: mask)
+                # one-thread broadcast barriers of the fused combine (the ticket, then the last
+                # CTA's abandoned mask); each completes exactly one phase (see _fused_combine)
                 cute.arch.mbarrier_init(storage.sComb.data_ptr() + 3, 1)
+                cute.arch.mbarrier_init(storage.sComb.data_ptr() + 4, 1)
 
         # ==== TMEM ==================================================================
         tmem_bar = pipeline.NamedBarrier(
@@ -602,7 +607,7 @@ class FlashAttentionMLADecodeSm100:
         if const_expr(self.fused_combine):
             self._fused_combine(
                 mO, mLSE, mOFinal, mLSEFinal, mSem,
-                storage.sComb.get_tensor(cute.make_layout(4)),
+                storage.sComb.get_tensor(cute.make_layout(5)),
                 tidx, warp_idx, head_kv, m_idx, hg_idx, mV.shape[2],
             )
 
@@ -644,15 +649,20 @@ class FlashAttentionMLADecodeSm100:
             -> its weak loads of the partials (causality order is transitive, 8.9.5).
             All accesses are generic proxy to the same addresses (proxy-preserved, 8.9.5).
           * slot posts carry no data: the last CTA's own acquire already covers all partials.
+          * the last CTA broadcasts the abandoned mask through a second mbarrier, not a second
+            phase of the ticket one: a parity wait is valid only while that phase is the
+            current or the immediately preceding one (9.7.14.16.19). With both broadcasts on
+            one mbarrier, a warp that reached its phase-0 wait after the mask arrive saw
+            phase 2 (parity 0, incomplete) and never returned.
         """
         S = const_expr(self.num_splits)
         h = const_expr(self.h)
         head_base = head_kv * self.qhead_per_kvhead + hg_idx * h
         gid = (m_idx * nheads_kv + head_kv) * self.num_head_groups + hg_idx
         ctr_ptr = mSem[gid, None].iterator  # [0] ticket counter, [1 + slot] slot posts
-        # corr thread 0 (and later warp 0 of the last CTA) publishes through sComb and arrives
-        # on this mbarrier (arrive is .release.cta, the waits are .acquire.cta: PTX 9.3
-        # 9.7.14.16.16 / 9.7.14.16.19), so all 512 threads read sComb after the write
+        # corr thread 0 publishes the ticket through sComb and arrives on this mbarrier (arrive
+        # is .release.cta, the waits are .acquire.cta: PTX 9.3 9.7.14.16.16 / 9.7.14.16.19), so
+        # all 512 threads read sComb after the write
         mbar_comb = sComb.iterator + 3
 
         if warp_idx >= self.corr_warp_lo and warp_idx < self.mma_warp_id:
@@ -680,6 +690,12 @@ class FlashAttentionMLADecodeSm100:
                 sComb[0] = epoch
                 sComb[1] = slot | (claimed << 8)
                 cute.arch.mbarrier_arrive(mbar_comb)
+        if const_expr(FUSED_COMBINE_TEST_LAG_NS > 0):
+            if warp_idx == self.mma_warp_id - 1:
+                t_lag = cute.arch.globaltimer()
+                t_now = t_lag
+                while t_now - t_lag < FUSED_COMBINE_TEST_LAG_NS:
+                    t_now = cute.arch.globaltimer()
         cute.arch.mbarrier_wait(mbar_comb, Int32(0))
         epoch = sComb[0]
         packed = Int32(sComb[1])
@@ -698,8 +714,8 @@ class FlashAttentionMLADecodeSm100:
                 mask = cute.arch.vote_ballot_sync(abandoned)
                 if tidx == 0:
                     sComb[2] = Int64(mask)
-                    cute.arch.mbarrier_arrive(mbar_comb)
-            cute.arch.mbarrier_wait(mbar_comb, Int32(1))
+                    cute.arch.mbarrier_arrive(mbar_comb + 1)
+            cute.arch.mbarrier_wait(mbar_comb + 1, Int32(0))
             mask = Int32(sComb[2])
             if mask != 0:
                 for sl in cutlass.range(S - 1, unroll=1):
