@@ -343,18 +343,39 @@ def _make_compile_only_tensor_spec(
     )
 
 
-def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks):
+def mla_decode_splits(
+    total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks, fp8_kv=False, dcp_size=1
+):
     """Choose head groups and KV splits for the sparse decode grid.
 
     More than 16 query heads per KV head only reach this kernel when DCP gathers 16 heads per
     rank, so each rank holds about 16 / qhead_per_kvhead of the top-k, packed at the front of the
     gather width. Such grids split at least qhead_per_kvhead // 8 ways, so that two splits see
     valid blocks, and never spend an extra wave on splitting.
+
+    fp8_kv: the e4m3 kernel splits the valid window evenly, so > 16-head grids may split two ways.
+
+    dcp_size: with dcp_size > 1, > 16-head fp8 grids grow head groups (down to 8 heads)
+    before choosing splits.
     """
     supported = FlashAttentionMLADecodeSm100.SUPPORTED_HEADS
     waves = lambda groups, splits: -(-total_q * nheads_kv * groups * splits // num_SMs)
     head_groups = next(g for g in (1, 2, 4, 8) if qhead_per_kvhead // g in supported)
     min_splits, extra_waves = (qhead_per_kvhead // 8, 0) if qhead_per_kvhead > 16 else (2, 1)
+    if fp8_kv:
+        min_splits = 2
+
+    def grow_head_groups(groups, min_heads, splits):
+        while (
+            qhead_per_kvhead // (2 * groups) in supported
+            and qhead_per_kvhead // (2 * groups) >= min_heads
+            and waves(2 * groups, splits) == waves(groups, splits)
+        ):
+            groups *= 2
+        return groups
+
+    if fp8_kv and qhead_per_kvhead > 16 and dcp_size > 1:
+        head_groups = grow_head_groups(head_groups, 8, 1)
     # Fewest waves per split, with at least two blocks per split.
     candidates = [1] + [
         s
@@ -365,22 +386,13 @@ def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_block
     ]
     splits = min(candidates, key=lambda s: waves(head_groups, s) / s)
 
-    def grow_head_groups(groups, min_heads):
-        while (
-            qhead_per_kvhead // (2 * groups) in supported
-            and qhead_per_kvhead // (2 * groups) >= min_heads
-            and waves(2 * groups, splits) == waves(groups, splits)
-        ):
-            groups *= 2
-        return groups
-
     # Fill the last wave: head groups down to 16 heads, then one block per split, then 8 heads.
-    head_groups = grow_head_groups(head_groups, 16)
+    head_groups = grow_head_groups(head_groups, 16, splits)
     if 2 * splits == num_n_blocks and (
         waves(head_groups, num_n_blocks) == waves(head_groups, splits)
     ):
         splits = num_n_blocks
-    head_groups = grow_head_groups(head_groups, 8)
+    head_groups = grow_head_groups(head_groups, 8, splits)
     return head_groups, splits
 
 
@@ -692,6 +704,7 @@ def _flash_attn_fwd(
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
+    sparse_decode_dcp_size: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -788,6 +801,10 @@ def _flash_attn_fwd(
             "fp8_kv_dequant requires fp8 e4m3 K/V"
         )
         assert page_table is not None, "fp8_kv_dequant requires paged KV (page_table)"
+    elif qv is not None and v.dtype == torch.float8_e4m3fn and qv.dtype != v.dtype:
+        raise NotImplementedError(
+            f"MLA over an fp8 e4m3 KV cache needs an e4m3 q/qv, got {qv.dtype}"
+        )
     else:
         input_tensors = {"q": q, "k": k, "v": v, "qv": qv}
         present = {name: t for name, t in input_tensors.items() if t is not None}
@@ -1026,7 +1043,7 @@ def _flash_attn_fwd(
         and gather_kv_indices is not None
         and cu_seqlens_q is not None
         and cu_seqlens_k is not None
-        and q_dtype in (torch.float16, torch.bfloat16)
+        and q_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and seqused_q is None
         and page_table is None
         and not requires_grad
@@ -1038,12 +1055,21 @@ def _flash_attn_fwd(
         and qhead_per_kvhead in (8, 16, 32, 64)
         and output_quant_key is None
     )
+    # e4m3 q/qv/K/V MLA runs only on the sparse decode kernel and takes no descales.
+    if is_fp8 and qv is not None and not use_sparse_decode:
+        raise NotImplementedError(
+            "fp8 MLA (qv) runs only on the SM100 sparse decode kernel: varlen q with "
+            "gather_kv_indices and cu_seqlens_k, no page_table, non-causal, head_dim 64 / "
+            "head_dim_v 512, 8/16/32/64 query heads per KV head, forward only"
+        )
     decode_splits = None
     if use_sparse_decode:
         decode_splits = mla_decode_splits(
             total_q, num_head_kv, qhead_per_kvhead,
             get_num_sms_for_selection(device.index, arch),
             gather_kv_indices.shape[-1] // 128,
+            fp8_kv=is_fp8,
+            dcp_size=sparse_decode_dcp_size,
         )
         num_splits = decode_splits[1]
 
@@ -3961,6 +3987,10 @@ def flash_attn_varlen_func(
         so we arrange for nheads as the contiguous mode for better vectorization.
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
+
+    fp8 MLA (q, qv, k and v all float8_e4m3fn, SM100/SM110 sparse decode only): no descales
+        are taken; fold q_scale * k_scale into softmax_scale and multiply the bf16 output by
+        v_scale.
 
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
